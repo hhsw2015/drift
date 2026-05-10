@@ -184,9 +184,9 @@ export default function App() {
         break;
       case "TransferComplete":
         completeTransfer(msg.id);
-        // Refresh both panes after transfer
-        fetchLocal(localPath);
-        send({ type: "BrowseRequest", path: remotePath });
+        // Refresh both panes after transfer using resolved absolute paths
+        fetchLocal(localInfo.cwd !== "..." ? localInfo.cwd : ".");
+        send({ type: "BrowseRequest", path: remoteInfo.cwd !== "..." ? remoteInfo.cwd : "." });
         break;
       case "TransferError":
         failTransfer(msg.id, msg.error);
@@ -371,8 +371,9 @@ export default function App() {
       setError("Your browser doesn't support secure random IDs. Please use a modern browser or access via HTTPS.");
       return;
     }
+    const sourceDir = localInfo.cwd;
     const transferEntries: TransferEntry[] = selectedEntries.map((e) => ({
-      relative_path: localPath === "." ? e.name : `${localPath}/${e.name}`,
+      relative_path: sourceDir === "/" ? e.name : `${sourceDir}/${e.name}`,
       size: e.size,
       is_dir: e.is_dir,
       permissions: e.permissions,
@@ -388,7 +389,7 @@ export default function App() {
       id: transferId,
       entries: transferEntries,
       direction: "Push",
-      destination_path: remotePath,
+      destination_path: remoteInfo.cwd,
     } as const;
 
     console.log("Sending transfer request:", msg);
@@ -397,7 +398,7 @@ export default function App() {
     // Clear selection
     setLocalSelected(new Set());
     lastClickedLocalRef.current = null;
-  }, [hasRemote, localSelected, localEntries, localPath, remotePath, send, hasActiveTransfers, startTransfer]);
+  }, [hasRemote, localSelected, localEntries, localInfo.cwd, remoteInfo.cwd, send, hasActiveTransfers, startTransfer]);
 
   const handleCopyToLocal = useCallback(() => {
     if (!hasRemote || remoteSelected.size === 0 || hasActiveTransfers) return;
@@ -413,8 +414,9 @@ export default function App() {
       setError("Your browser doesn't support secure random IDs. Please use a modern browser or access via HTTPS.");
       return;
     }
+    const remoteDir = remoteInfo.cwd;
     const transferEntries: TransferEntry[] = selectedEntries.map((e) => ({
-      relative_path: remotePath === "." ? e.name : `${remotePath}/${e.name}`,
+      relative_path: remoteDir === "/" ? e.name : `${remoteDir}/${e.name}`,
       size: e.size,
       is_dir: e.is_dir,
       permissions: e.permissions,
@@ -430,13 +432,13 @@ export default function App() {
       id: transferId,
       entries: transferEntries,
       direction: "Pull",
-      destination_path: localPath,
+      destination_path: localInfo.cwd,
     });
 
     // Clear selection
     setRemoteSelected(new Set());
     lastClickedRemoteRef.current = null;
-  }, [hasRemote, remoteSelected, remoteEntries, remotePath, localPath, send, hasActiveTransfers, startTransfer]);
+  }, [hasRemote, remoteSelected, remoteEntries, remoteInfo.cwd, localInfo.cwd, send, hasActiveTransfers, startTransfer]);
 
   const activeTransfers = [...transfers.values()];
 
