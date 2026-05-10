@@ -636,6 +636,9 @@ pub async fn perform_client_handshake(
             );
         }
         tracing::info!("Server confirmed plaintext mode");
+        // Send HandshakeComplete so server knows we're a CLI client (not browser)
+        let complete = serde_json::to_string(&ControlMessage::HandshakeComplete)?;
+        ws_write.send(Message::Text(complete.into())).await?;
         return Ok((
             CryptoStream::plaintext(),
             "plaintext".to_string(),
