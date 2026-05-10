@@ -196,11 +196,11 @@ async fn receive_transfer(
                 received += chunk.len() as u64;
                 writer.write_chunk(&chunk).await?;
 
-                // Log progress at 10% intervals if we have a size hint
-                let percent = received / (1024 * 1024); // per-MB marker
-                if percent > last_percent {
+                // Log progress every 10MB to reduce IO overhead
+                let marker = received / (10 * 1024 * 1024);
+                if marker > last_percent {
                     tracing::info!("  received {}", format_bytes(received));
-                    last_percent = percent;
+                    last_percent = marker;
                 }
             }
             DecryptedFrame::Control(ControlMessage::TransferComplete { id, total_bytes })
