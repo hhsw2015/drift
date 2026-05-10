@@ -38,7 +38,7 @@ export default function FilePane({
 }: FilePaneProps) {
   const handleGoUp = useCallback(() => {
     const parts = cwd.split("/").filter(Boolean);
-    if (parts.length > 1) {
+    if (parts.length > 0) {
       onNavigate("..");
     }
   }, [cwd, onNavigate]);
