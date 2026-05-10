@@ -231,6 +231,7 @@ pub async fn connect_to_remote(
     target: &str,
     password: &Option<String>,
     allow_insecure_tls: bool,
+    no_encryption: bool,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = open_ws(target, allow_insecure_tls).await?;
@@ -239,12 +240,19 @@ pub async fn connect_to_remote(
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let (crypto, fp, peer_version) =
-        perform_client_handshake(&mut ws_write, &mut ws_read, password).await?;
-    tracing::info!(
-        "Handshake complete, connection encrypted (fingerprint: {}), peer version: {:?}",
-        fp,
-        peer_version
-    );
+        perform_client_handshake(&mut ws_write, &mut ws_read, password, no_encryption).await?;
+    if no_encryption {
+        tracing::info!(
+            "Handshake complete, plaintext mode (no encryption), peer version: {:?}",
+            peer_version
+        );
+    } else {
+        tracing::info!(
+            "Handshake complete, connection encrypted (fingerprint: {}), peer version: {:?}",
+            fp,
+            peer_version
+        );
+    }
     *state.fingerprint.write().await = Some(fp);
 
     // Remember credentials for FE Reconnect button. Only stored once the
@@ -604,23 +612,53 @@ pub async fn perform_client_handshake(
         >,
     >,
     password: &Option<String>,
+    no_encryption: bool,
 ) -> anyhow::Result<(CryptoStream, String, Option<u32>)> {
-    let client_keypair = KeyPair::generate();
-
-    let (server_public, peer_version) = match ws_read.next().await {
-        Some(Ok(Message::Text(text))) => {
-            if let Ok(ControlMessage::KeyExchange {
-                public_key,
-                protocol_version,
-            }) = serde_json::from_str(&text)
-            {
-                (decode_public_key(&public_key)?, protocol_version)
-            } else {
-                anyhow::bail!("Expected KeyExchange message from server");
-            }
-        }
-        _ => anyhow::bail!("Failed to receive server public key"),
+    // Read the first message from the server
+    let first_msg = match ws_read.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => anyhow::bail!("Failed to receive server handshake message"),
     };
+
+    let first: ControlMessage = serde_json::from_str(&first_msg)?;
+
+    // Handle PlaintextMode from server
+    if let ControlMessage::PlaintextMode { protocol_version } = first {
+        if !no_encryption {
+            anyhow::bail!(
+                "Server is in plaintext mode but client has encryption enabled. \
+                 Use --no-encryption to connect to this server."
+            );
+        }
+        tracing::info!("Server confirmed plaintext mode");
+        return Ok((
+            CryptoStream::plaintext(),
+            "plaintext".to_string(),
+            protocol_version,
+        ));
+    }
+
+    // Server sent KeyExchange -- proceed with encrypted handshake
+    let (server_public, peer_version) = if let ControlMessage::KeyExchange {
+        public_key,
+        protocol_version,
+    } = first
+    {
+        if no_encryption {
+            anyhow::bail!(
+                "Server requires encryption but client has --no-encryption set. \
+                 Remove --no-encryption or configure the server with --no-encryption."
+            );
+        }
+        (decode_public_key(&public_key)?, protocol_version)
+    } else {
+        anyhow::bail!(
+            "Expected KeyExchange or PlaintextMode message from server, got: {:?}",
+            first
+        );
+    };
+
+    let client_keypair = KeyPair::generate();
 
     let msg = ControlMessage::KeyExchange {
         public_key: client_keypair.public_key_base64(),

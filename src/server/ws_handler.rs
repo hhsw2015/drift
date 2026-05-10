@@ -30,139 +30,35 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 
     tracing::info!("New WebSocket connection");
 
-    // Send our public key first (server-to-server probe)
-    use crate::crypto::handshake::KeyPair;
-    let server_keypair = KeyPair::generate();
-    let key_exchange = ControlMessage::KeyExchange {
-        public_key: server_keypair.public_key_base64(),
-        protocol_version: Some(CURRENT_PROTOCOL_VERSION),
-    };
-    if sender
-        .send(Message::Text(
-            serde_json::to_string(&key_exchange).unwrap().into(),
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
+    use crate::crypto::stream::CryptoStream;
 
-    // Wait for first message to determine connection type
-    let first_msg = match receiver.next().await {
-        Some(Ok(Message::Text(text))) => text,
-        _ => return,
-    };
+    let no_encryption = state.config.no_encryption;
 
-    // KeyExchange response → server-to-server encrypted connection
-    if let Ok(ControlMessage::KeyExchange {
-        public_key,
-        protocol_version,
-    }) = serde_json::from_str(&first_msg)
-    {
-        let peer_version = protocol_version;
-        tracing::info!(
-            "Server-to-server connection detected, completing handshake (peer version: {:?})",
-            peer_version
-        );
-
-        use crate::crypto::handshake::{
-            decode_public_key, derive_shared_secret, fingerprint, generate_nonce, verify_auth_proof,
+    // In no-encryption mode, send PlaintextMode instead of KeyExchange
+    if no_encryption {
+        let plaintext_msg = ControlMessage::PlaintextMode {
+            protocol_version: Some(CURRENT_PROTOCOL_VERSION),
         };
-        use crate::crypto::stream::CryptoStream;
-        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
-        let client_public = match decode_public_key(&public_key) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::error!("Invalid public key: {}", e);
-                return;
-            }
-        };
-
-        let shared_secret = derive_shared_secret(server_keypair.secret, &client_public);
-        let crypto = Arc::new(CryptoStream::from_shared_secret(&shared_secret, true));
-
-        // Password authentication: if configured, challenge the client
-        if let Some(ref password) = state.config.password {
-            let nonce = generate_nonce();
-            let challenge = ControlMessage::AuthChallenge {
-                nonce: BASE64.encode(&nonce),
-            };
-            if sender
-                .send(Message::Text(
-                    serde_json::to_string(&challenge).unwrap().into(),
-                ))
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            let proof_bytes = match receiver.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(ControlMessage::AuthResponse { proof }) = serde_json::from_str(&text)
-                    {
-                        match BASE64.decode(&proof) {
-                            Ok(bytes) => bytes,
-                            Err(_) => {
-                                tracing::error!("Invalid auth proof encoding");
-                                let _ = sender
-                                    .send(Message::Text(
-                                        serde_json::to_string(&ControlMessage::Error {
-                                            message: "authentication failed".into(),
-                                        })
-                                        .unwrap()
-                                        .into(),
-                                    ))
-                                    .await;
-                                return;
-                            }
-                        }
-                    } else {
-                        tracing::error!(
-                            "Expected AuthResponse, got: {}",
-                            &text[..text.len().min(100)]
-                        );
-                        let _ = sender
-                            .send(Message::Text(
-                                serde_json::to_string(&ControlMessage::Error {
-                                    message: "authentication failed".into(),
-                                })
-                                .unwrap()
-                                .into(),
-                            ))
-                            .await;
-                        return;
-                    }
-                }
-                _ => {
-                    tracing::error!("Connection closed during authentication");
-                    return;
-                }
-            };
-
-            if !verify_auth_proof(password, &nonce, &shared_secret, &proof_bytes) {
-                tracing::error!("Authentication failed: invalid password");
-                let _ = sender
-                    .send(Message::Text(
-                        serde_json::to_string(&ControlMessage::Error {
-                            message: "authentication failed".into(),
-                        })
-                        .unwrap()
-                        .into(),
-                    ))
-                    .await;
-                return;
-            }
-
-            tracing::info!("Password authentication successful");
-        }
-
         if sender
             .send(Message::Text(
-                serde_json::to_string(&ControlMessage::HandshakeComplete)
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&plaintext_msg).unwrap().into(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    } else {
+        // Send our public key first (server-to-server probe)
+        use crate::crypto::handshake::KeyPair;
+        let server_keypair = KeyPair::generate();
+        let key_exchange = ControlMessage::KeyExchange {
+            public_key: server_keypair.public_key_base64(),
+            protocol_version: Some(CURRENT_PROTOCOL_VERSION),
+        };
+        if sender
+            .send(Message::Text(
+                serde_json::to_string(&key_exchange).unwrap().into(),
             ))
             .await
             .is_err()
@@ -170,12 +66,201 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
             return;
         }
 
-        let fp = fingerprint(&shared_secret);
-        tracing::info!(
-            "Handshake complete, encrypted connection established (fingerprint: {})",
-            fp
-        );
-        *state.fingerprint.write().await = Some(fp);
+        // Wait for first message to determine connection type
+        let first_msg = match receiver.next().await {
+            Some(Ok(Message::Text(text))) => text,
+            _ => return,
+        };
+
+        // KeyExchange response -> server-to-server encrypted connection
+        if let Ok(ControlMessage::KeyExchange {
+            public_key,
+            protocol_version,
+        }) = serde_json::from_str(&first_msg)
+        {
+            handle_encrypted_connection(
+                sender,
+                receiver,
+                state,
+                server_keypair,
+                &public_key,
+                protocol_version,
+            )
+            .await;
+            return;
+        }
+
+        // Not a KeyExchange -> browser connection (plaintext, handled below)
+        handle_browser_connection(sender, receiver, state, &first_msg).await;
+        return;
+    }
+
+    // No-encryption mode: wait for first message to determine connection type
+    let first_msg = match receiver.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => return,
+    };
+
+    // In no-encryption mode, a server-to-server client won't send KeyExchange.
+    // We detect a JSON control message to decide if it's a server-to-server or browser.
+    // If it looks like a KeyExchange anyway (mismatch), we reject it.
+    if let Ok(ControlMessage::KeyExchange { .. }) = serde_json::from_str::<ControlMessage>(&first_msg) {
+        tracing::error!("Received KeyExchange from client but server is in --no-encryption mode");
+        let _ = sender
+            .send(Message::Text(
+                serde_json::to_string(&ControlMessage::Error {
+                    message: "Server is in plaintext mode, encryption not supported".into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await;
+        return;
+    }
+
+    // In plaintext mode, server-to-server connections proceed directly with no crypto.
+    // The client signals readiness by sending HandshakeComplete (or any non-browser message).
+    if let Ok(ControlMessage::HandshakeComplete) = serde_json::from_str::<ControlMessage>(&first_msg) {
+        let peer_version = Some(CURRENT_PROTOCOL_VERSION);
+        tracing::info!("Server-to-server plaintext connection established");
+
+        let crypto = Arc::new(CryptoStream::plaintext());
+        *state.fingerprint.write().await = Some("plaintext".to_string());
+
+        run_server_to_server_loop(sender, receiver, state, crypto, peer_version).await;
+        return;
+    }
+
+    // Otherwise, treat as browser connection
+    handle_browser_connection(sender, receiver, state, &first_msg).await;
+}
+
+/// Handle the encrypted server-to-server connection after receiving a KeyExchange from the client.
+async fn handle_encrypted_connection(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    state: Arc<AppState>,
+    server_keypair: crate::crypto::handshake::KeyPair,
+    public_key: &str,
+    protocol_version: Option<u32>,
+) {
+    let peer_version = protocol_version;
+    tracing::info!(
+        "Server-to-server connection detected, completing handshake (peer version: {:?})",
+        peer_version
+    );
+
+    use crate::crypto::handshake::{
+        decode_public_key, derive_shared_secret, fingerprint, generate_nonce, verify_auth_proof,
+    };
+    use crate::crypto::stream::CryptoStream;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+    let client_public = match decode_public_key(public_key) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::error!("Invalid public key: {}", e);
+            return;
+        }
+    };
+
+    let shared_secret = derive_shared_secret(server_keypair.secret, &client_public);
+    let crypto = Arc::new(CryptoStream::from_shared_secret(&shared_secret, true));
+
+    // Password authentication: if configured, challenge the client
+    if let Some(ref password) = state.config.password {
+        let nonce = generate_nonce();
+        let challenge = ControlMessage::AuthChallenge {
+            nonce: BASE64.encode(&nonce),
+        };
+        if sender
+            .send(Message::Text(
+                serde_json::to_string(&challenge).unwrap().into(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let proof_bytes = match receiver.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(ControlMessage::AuthResponse { proof }) = serde_json::from_str(&text)
+                {
+                    match BASE64.decode(&proof) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            tracing::error!("Invalid auth proof encoding");
+                            let _ = sender
+                                .send(Message::Text(
+                                    serde_json::to_string(&ControlMessage::Error {
+                                        message: "authentication failed".into(),
+                                    })
+                                    .unwrap()
+                                    .into(),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        "Expected AuthResponse, got: {}",
+                        &text[..text.len().min(100)]
+                    );
+                    let _ = sender
+                        .send(Message::Text(
+                            serde_json::to_string(&ControlMessage::Error {
+                                message: "authentication failed".into(),
+                            })
+                            .unwrap()
+                            .into(),
+                        ))
+                        .await;
+                    return;
+                }
+            }
+            _ => {
+                tracing::error!("Connection closed during authentication");
+                return;
+            }
+        };
+
+        if !verify_auth_proof(password, &nonce, &shared_secret, &proof_bytes) {
+            tracing::error!("Authentication failed: invalid password");
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::to_string(&ControlMessage::Error {
+                        message: "authentication failed".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await;
+            return;
+        }
+
+        tracing::info!("Password authentication successful");
+    }
+
+    if sender
+        .send(Message::Text(
+            serde_json::to_string(&ControlMessage::HandshakeComplete)
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let fp = fingerprint(&shared_secret);
+    tracing::info!(
+        "Handshake complete, encrypted connection established (fingerprint: {})",
+        fp
+    );
+    *state.fingerprint.write().await = Some(fp);
 
         // Single unified outbound channel: pre-encoded frames (type byte + payload).
         // All outbound messages — data chunks AND control messages — go through this

@@ -21,6 +21,10 @@ pub enum ControlMessage {
         #[serde(default)]
         protocol_version: Option<u32>,
     },
+    PlaintextMode {
+        #[serde(default)]
+        protocol_version: Option<u32>,
+    },
     AuthChallenge {
         nonce: String,
     },

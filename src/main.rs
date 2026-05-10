@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long)]
     disable_ui: bool,
 
+    /// Disable application-level encryption (use when behind a TLS proxy like Cloudflare Tunnel)
+    #[arg(long)]
+    no_encryption: bool,
+
     /// Run the server in the background (logs appended to ./drift.log in the current directory)
     #[arg(long)]
     daemon: bool,
@@ -63,6 +67,9 @@ enum Commands {
         /// Accept self-signed or invalid TLS certificates
         #[arg(long)]
         allow_insecure_tls: bool,
+        /// Disable application-level encryption
+        #[arg(long)]
+        no_encryption: bool,
     },
     /// List files on a remote drift server
     Ls {
@@ -77,6 +84,9 @@ enum Commands {
         /// Accept self-signed or invalid TLS certificates
         #[arg(long)]
         allow_insecure_tls: bool,
+        /// Disable application-level encryption
+        #[arg(long)]
+        no_encryption: bool,
     },
     /// Pull a file or folder from a remote drift server
     Pull {
@@ -94,6 +104,9 @@ enum Commands {
         /// Accept self-signed or invalid TLS certificates
         #[arg(long)]
         allow_insecure_tls: bool,
+        /// Disable application-level encryption
+        #[arg(long)]
+        no_encryption: bool,
     },
 }
 
@@ -113,15 +126,26 @@ async fn main() -> anyhow::Result<()> {
             path,
             password,
             allow_insecure_tls,
-        }) => client::send::send_file(&target, &path, &password, allow_insecure_tls).await,
+            no_encryption,
+        }) => {
+            client::send::send_file(&target, &path, &password, allow_insecure_tls, no_encryption)
+                .await
+        }
         Some(Commands::Ls {
             target,
             path,
             password,
             allow_insecure_tls,
+            no_encryption,
         }) => {
-            client::browse::browse_remote(&target, path.as_deref(), &password, allow_insecure_tls)
-                .await
+            client::browse::browse_remote(
+                &target,
+                path.as_deref(),
+                &password,
+                allow_insecure_tls,
+                no_encryption,
+            )
+            .await
         }
         Some(Commands::Pull {
             target,
@@ -129,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             password,
             allow_insecure_tls,
+            no_encryption,
         }) => {
             client::pull::pull_remote(
                 &target,
@@ -136,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 output.as_deref(),
                 &password,
                 allow_insecure_tls,
+                no_encryption,
             )
             .await
         }
@@ -154,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                     file_path,
                     &cli.password,
                     cli.allow_insecure_tls,
+                    cli.no_encryption,
                 )
                 .await;
             }
@@ -164,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.password,
                 cli.allow_insecure_tls,
                 cli.disable_ui,
+                cli.no_encryption,
             )
             .await
         }
@@ -213,6 +241,7 @@ async fn run_server(
     password: Option<String>,
     allow_insecure_tls: bool,
     disable_ui: bool,
+    no_encryption: bool,
 ) -> anyhow::Result<()> {
     let config = AppConfig {
         target: target.clone(),
@@ -223,6 +252,7 @@ async fn run_server(
             .unwrap_or_else(|_| "unknown".to_string()),
         allow_insecure_tls,
         disable_ui,
+        no_encryption,
     };
 
     let state = Arc::new(server::AppState::new(config.clone()));
@@ -232,8 +262,14 @@ async fn run_server(
         let state_clone = state.clone();
         let password = config.password.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                client::connect_to_remote(&target, &password, allow_insecure_tls, state_clone).await
+            if let Err(e) = client::connect_to_remote(
+                &target,
+                &password,
+                allow_insecure_tls,
+                no_encryption,
+                state_clone,
+            )
+            .await
             {
                 tracing::error!("Failed to connect to remote: {}", e);
             }

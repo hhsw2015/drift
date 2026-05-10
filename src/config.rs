@@ -8,4 +8,5 @@ pub struct AppConfig {
     pub hostname: String,
     pub allow_insecure_tls: bool,
     pub disable_ui: bool,
+    pub no_encryption: bool,
 }

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[allow(dead_code)]
 pub struct CryptoStream {
-    send_cipher: ChaCha20Poly1305,
-    recv_cipher: ChaCha20Poly1305,
+    send_cipher: Option<ChaCha20Poly1305>,
+    recv_cipher: Option<ChaCha20Poly1305>,
     send_nonce_prefix: [u8; 4],
     recv_nonce_prefix: [u8; 4],
     send_counter: AtomicU64,
@@ -18,6 +18,19 @@ pub struct CryptoStream {
 
 #[allow(dead_code)]
 impl CryptoStream {
+    /// Create a plaintext (no-op) stream that passes data through unchanged.
+    /// Used when `--no-encryption` is set and transport-level TLS handles security.
+    pub fn plaintext() -> Self {
+        Self {
+            send_cipher: None,
+            recv_cipher: None,
+            send_nonce_prefix: [0u8; 4],
+            recv_nonce_prefix: [0u8; 4],
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+        }
+    }
+
     pub fn from_shared_secret(shared_secret: &[u8; 32], is_server: bool) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(b"drift-c2s"), shared_secret);
         let mut c2s_key = [0u8; 32];
@@ -42,8 +55,8 @@ impl CryptoStream {
         };
 
         Self {
-            send_cipher: ChaCha20Poly1305::new_from_slice(&send_key).unwrap(),
-            recv_cipher: ChaCha20Poly1305::new_from_slice(&recv_key).unwrap(),
+            send_cipher: Some(ChaCha20Poly1305::new_from_slice(&send_key).unwrap()),
+            recv_cipher: Some(ChaCha20Poly1305::new_from_slice(&recv_key).unwrap()),
             send_nonce_prefix: send_prefix,
             recv_nonce_prefix: recv_prefix,
             send_counter: AtomicU64::new(0),
@@ -59,17 +72,23 @@ impl CryptoStream {
     }
 
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let Some(ref cipher) = self.send_cipher else {
+            return Ok(plaintext.to_vec());
+        };
         let counter = self.send_counter.fetch_add(1, Ordering::SeqCst);
         let nonce = Self::make_nonce(&self.send_nonce_prefix, counter);
-        self.send_cipher
+        cipher
             .encrypt(&nonce, plaintext)
             .map_err(|_| CryptoError::EncryptionFailed)
     }
 
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let Some(ref cipher) = self.recv_cipher else {
+            return Ok(ciphertext.to_vec());
+        };
         let counter = self.recv_counter.fetch_add(1, Ordering::SeqCst);
         let nonce = Self::make_nonce(&self.recv_nonce_prefix, counter);
-        self.recv_cipher
+        cipher
             .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
