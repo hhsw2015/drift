@@ -646,6 +646,7 @@ async fn handle_browser_message(
             entries,
             direction,
             destination_path,
+            resume_hints,
         } => {
             tracing::info!(
                 "Browser TransferRequest: id={}, entries={}, direction={:?}, dest={}",
@@ -655,12 +656,13 @@ async fn handle_browser_message(
                 destination_path
             );
             tokio::spawn(async move {
-                browser_transfer::handle_browser_transfer(
+                browser_transfer::handle_browser_transfer_with_resume(
                     state,
                     id,
                     entries,
                     direction,
                     destination_path,
+                    resume_hints,
                     ws_tx,
                 )
                 .await;
@@ -712,13 +714,15 @@ async fn handle_server_to_server_request(
             entries,
             direction,
             destination_path,
+            resume_hints,
         } => {
             tracing::info!(
-                "Server received TransferRequest from client: id={}, entries={}, direction={:?}, dest={}",
+                "Server received TransferRequest from client: id={}, entries={}, direction={:?}, dest={}, resume_hints={}",
                 id,
                 entries.len(),
                 direction,
-                destination_path
+                destination_path,
+                resume_hints.len(),
             );
 
             use crate::protocol::messages::Direction;
@@ -760,20 +764,23 @@ async fn handle_server_to_server_request(
                     };
 
                     let root_dir = state.config.root_dir.clone();
+                    let resume_offsets = resume_hints.clone();
                     tokio::spawn(async move {
-                        browser_transfer::send_entries(
+                        browser_transfer::send_entries_with_resume(
                             &root_dir,
                             id,
                             &entries,
                             &frame_tx,
                             peer_version,
+                            &resume_offsets,
                         )
                         .await;
                     });
 
+                    // Confirm the resume offsets back to the requester
                     Some(ControlMessage::TransferAccepted {
                         id,
-                        resume_offsets: std::collections::HashMap::new(),
+                        resume_offsets: resume_hints,
                     })
                 }
             }

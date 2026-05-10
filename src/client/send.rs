@@ -67,6 +67,7 @@ pub async fn send_file(
             use std::os::unix::fs::PermissionsExt;
             metadata.permissions().mode()
         },
+        compression: None,
     };
 
     let request = ControlMessage::TransferRequest {
@@ -74,6 +75,7 @@ pub async fn send_file(
         entries: vec![entry],
         direction: Direction::Push,
         destination_path: ".".to_string(),
+        resume_hints: std::collections::HashMap::new(),
     };
 
     send_encrypted_control(&crypto, &mut ws_write, &request).await?;

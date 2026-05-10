@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::path::Path;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -71,11 +72,26 @@ pub async fn pull_remote(
         is_dir,
         #[cfg(unix)]
         permissions: entry_info.permissions,
+        compression: None,
     };
 
     let destination = output_dir
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
+
+    // Check for existing .part files to support resumable transfers
+    let mut resume_hints = HashMap::new();
+    if !is_dir {
+        let output = output_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let target_path = output.join(&file_name);
+        let offset = ChunkedWriter::resume_offset(&target_path).await;
+        if offset > 0 {
+            tracing::info!("Found partial download for {}: {} bytes, requesting resume", file_name, offset);
+            resume_hints.insert(remote_path.to_string(), offset);
+        }
+    }
 
     send_encrypted_control(
         &crypto,
@@ -85,16 +101,19 @@ pub async fn pull_remote(
             entries: vec![entry],
             direction: Direction::Pull,
             destination_path: destination,
+            resume_hints,
         },
     )
     .await?;
 
-    // Wait for acceptance
+    // Wait for acceptance and get confirmed resume offsets
+    let confirmed_offsets: HashMap<String, u64>;
     loop {
         let msg = recv_control_with_replies(&crypto, &mut ws_write, &mut ws_read).await?;
         match msg {
-            ControlMessage::TransferAccepted { id, .. } if id == transfer_id => {
-                tracing::info!("Transfer accepted");
+            ControlMessage::TransferAccepted { id, resume_offsets } if id == transfer_id => {
+                tracing::info!("Transfer accepted, resume_offsets: {:?}", resume_offsets);
+                confirmed_offsets = resume_offsets;
                 break;
             }
             ControlMessage::TransferError { error, .. } => {
@@ -118,6 +137,12 @@ pub async fn pull_remote(
         (output.join(&file_name), None)
     };
 
+    // Determine confirmed resume offset for this file
+    let confirmed_offset = confirmed_offsets
+        .get(remote_path)
+        .copied()
+        .unwrap_or(0);
+
     // Receive data
     tracing::info!("Pulling {} ...", file_name);
     receive_transfer(
@@ -126,6 +151,7 @@ pub async fn pull_remote(
         &mut ws_read,
         transfer_id,
         &write_path,
+        confirmed_offset,
     )
     .await?;
 
@@ -150,8 +176,13 @@ async fn receive_transfer(
     ws_read: &mut WsRead,
     transfer_id: Uuid,
     write_path: &Path,
+    resume_offset: u64,
 ) -> anyhow::Result<()> {
-    let mut writer = ChunkedWriter::create(write_path).await?;
+    let mut writer = if resume_offset > 0 {
+        ChunkedWriter::create_with_resume(write_path, resume_offset).await?
+    } else {
+        ChunkedWriter::create(write_path).await?
+    };
     let mut received: u64 = 0;
     let mut last_percent: u64 = 0;
 

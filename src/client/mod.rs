@@ -532,13 +532,15 @@ async fn handle_incoming_request(
             entries,
             direction,
             destination_path,
+            resume_hints,
         } => {
             tracing::info!(
-                "Client received TransferRequest from server: id={}, entries={}, direction={:?}, dest={}",
+                "Client received TransferRequest from server: id={}, entries={}, direction={:?}, dest={}, resume_hints={}",
                 id,
                 entries.len(),
                 direction,
-                destination_path
+                destination_path,
+                resume_hints.len(),
             );
 
             use crate::protocol::messages::Direction;
@@ -576,20 +578,23 @@ async fn handle_incoming_request(
                     };
 
                     let root_dir = state.config.root_dir.clone();
+                    let resume_offsets = resume_hints.clone();
                     tokio::spawn(async move {
-                        crate::server::browser_transfer::send_entries(
+                        crate::server::browser_transfer::send_entries_with_resume(
                             &root_dir,
                             id,
                             &entries,
                             &frame_tx,
                             peer_version,
+                            &resume_offsets,
                         )
                         .await;
                     });
 
+                    // Confirm resume offsets back to the requester
                     Some(ControlMessage::TransferAccepted {
                         id,
-                        resume_offsets: std::collections::HashMap::new(),
+                        resume_offsets: resume_hints,
                     })
                 }
             }

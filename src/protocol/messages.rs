@@ -57,6 +57,10 @@ pub enum ControlMessage {
         direction: Direction,
         #[serde(default = "default_destination")]
         destination_path: String,
+        /// Client-supplied resume hints: path -> byte offset already received.
+        /// Server uses these to seek past already-transferred bytes.
+        #[serde(default)]
+        resume_hints: HashMap<String, u64>,
     },
     TransferAccepted {
         id: Uuid,
@@ -108,6 +112,10 @@ pub struct TransferEntry {
     pub is_dir: bool,
     #[cfg(unix)]
     pub permissions: u32,
+    /// Compression hint: "none", "gzip", or absent (auto).
+    /// When "none", directories are sent as tar without gzip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
