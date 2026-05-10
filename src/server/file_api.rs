@@ -132,6 +132,7 @@ async fn do_connect(
     let mut event_rx = state.browser_events.subscribe();
 
     let allow_insecure_tls = state.config.allow_insecure_tls;
+    let no_encryption = state.config.no_encryption;
     let state_clone = state.clone();
     let target_clone = target.clone();
     let password_clone = password.clone();
@@ -145,6 +146,7 @@ async fn do_connect(
             &target_clone,
             &password_clone,
             allow_insecure_tls,
+            no_encryption,
             state_clone,
         )
         .await

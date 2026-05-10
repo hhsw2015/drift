@@ -262,289 +262,305 @@ async fn handle_encrypted_connection(
     );
     *state.fingerprint.write().await = Some(fp);
 
-        // Single unified outbound channel: pre-encoded frames (type byte + payload).
-        // All outbound messages — data chunks AND control messages — go through this
-        // FIFO queue. The write task encrypts each frame and sends as a binary WS frame.
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    run_server_to_server_loop(sender, receiver, state, crypto, peer_version).await;
+}
 
-        // Separate request channel for browser-forwarded requests needing responses
-        let (request_tx, mut request_rx) =
-            mpsc::unbounded_channel::<(ControlMessage, ResponseChannel)>();
+async fn run_server_to_server_loop(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    state: Arc<AppState>,
+    crypto: Arc<crate::crypto::stream::CryptoStream>,
+    peer_version: Option<u32>,
+) {
+    // Single unified outbound channel: pre-encoded frames (type byte + payload).
+    // All outbound messages — data chunks AND control messages — go through this
+    // FIFO queue. The write task encrypts each frame and sends as a binary WS frame.
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let pending = Arc::new(Mutex::new(HashMap::<Uuid, ResponseChannel>::new()));
-        let pending_request = pending.clone();
-        let pending_read = pending.clone();
+    // Separate request channel for browser-forwarded requests needing responses
+    let (request_tx, mut request_rx) =
+        mpsc::unbounded_channel::<(ControlMessage, ResponseChannel)>();
 
-        let crypto_write = crypto.clone();
-        let crypto_read = crypto.clone();
-        let state_read = state.clone();
-        let frame_tx_read = frame_tx.clone();
+    let pending = Arc::new(Mutex::new(HashMap::<Uuid, ResponseChannel>::new()));
+    let pending_request = pending.clone();
+    let pending_read = pending.clone();
 
-        // Request handler: routes browser API requests to remote, tracks pending responses
-        let frame_tx_request = frame_tx.clone();
-        let request_handle = tokio::spawn(async move {
-            while let Some((msg, response_tx)) = request_rx.recv().await {
-                let id = Uuid::new_v4();
-                pending_request.lock().await.insert(id, response_tx);
-                let json = serde_json::to_string(&msg).unwrap();
-                let _ = frame_tx_request.send(encode_control_frame(json.as_bytes()));
-            }
-        });
+    let crypto_write = crypto.clone();
+    let crypto_read = crypto.clone();
+    let state_read = state.clone();
+    let frame_tx_read = frame_tx.clone();
 
-        // Write task: encrypt each frame, send as binary WS frame
-        let write_handle = tokio::spawn(async move {
-            while let Some(frame) = frame_rx.recv().await {
-                match crypto_write.encrypt(&frame) {
-                    Ok(ciphertext) => {
-                        if sender
-                            .send(Message::Binary(ciphertext.into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Encryption failed: {}", e);
+    // Request handler: routes browser API requests to remote, tracks pending responses
+    let frame_tx_request = frame_tx.clone();
+    let request_handle = tokio::spawn(async move {
+        while let Some((msg, response_tx)) = request_rx.recv().await {
+            let id = Uuid::new_v4();
+            pending_request.lock().await.insert(id, response_tx);
+            let json = serde_json::to_string(&msg).unwrap();
+            let _ = frame_tx_request.send(encode_control_frame(json.as_bytes()));
+        }
+    });
+
+    // Write task: encrypt each frame, send as binary WS frame
+    let write_handle = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            match crypto_write.encrypt(&frame) {
+                Ok(ciphertext) => {
+                    if sender
+                        .send(Message::Binary(ciphertext.into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
+                Err(e) => {
+                    tracing::error!("Encryption failed: {}", e);
+                    break;
+                }
             }
-        });
+        }
+    });
 
-        // Read task: decrypt each binary frame, dispatch by type byte
-        let read_handle = tokio::spawn(async move {
-            while let Some(Ok(msg)) = receiver.next().await {
-                match msg {
-                    Message::Binary(encrypted_data) => {
-                        let plaintext = match crypto_read.decrypt(&encrypted_data) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::error!("Decryption failed: {}", e);
-                                break;
-                            }
-                        };
+    // Read task: decrypt each binary frame, dispatch by type byte
+    let read_handle = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Binary(encrypted_data) => {
+                    let plaintext = match crypto_read.decrypt(&encrypted_data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!("Decryption failed: {}", e);
+                            break;
+                        }
+                    };
 
-                        let (frame_type, payload) = match decode_frame_type(&plaintext) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::error!("Frame decode failed: {}", e);
-                                break;
-                            }
-                        };
+                    let (frame_type, payload) = match decode_frame_type(&plaintext) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Frame decode failed: {}", e);
+                            break;
+                        }
+                    };
 
-                        match frame_type {
-                            FRAME_TYPE_DATA | FRAME_TYPE_DATA_V2 => {
-                                match decode_data_frame(payload, frame_type) {
-                                    Ok((transfer_id, file_index, offset, chunk)) => {
-                                        match state_read
-                                            .transfer_receiver
-                                            .receive_chunk(transfer_id, file_index, offset, chunk)
-                                            .await
-                                        {
-                                            Ok(true) => {
-                                                tracing::info!(
-                                                    "WS_HANDLER: Sending TransferFinalized for {}",
-                                                    transfer_id
-                                                );
-                                                // Finalized — send TransferFinalized back
-                                                let msg = ControlMessage::TransferFinalized {
-                                                    id: transfer_id,
-                                                };
-                                                let json = serde_json::to_string(&msg).unwrap();
-                                                let _ = frame_tx_read
-                                                    .send(encode_control_frame(json.as_bytes()));
-                                            }
-                                            Ok(false) => {}
-                                            Err(e) => {
-                                                tracing::error!("Failed to write chunk: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to decode data frame: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            FRAME_TYPE_CONTROL => {
-                                let control_msg =
-                                    match serde_json::from_slice::<ControlMessage>(payload) {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to parse control message: {}",
-                                                e
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                if let ControlMessage::TransferComplete { id, total_bytes } =
-                                    control_msg
-                                {
-                                    tracing::info!(
-                                        "Received TransferComplete: {} ({} bytes)",
-                                        id,
-                                        total_bytes
-                                    );
+                    match frame_type {
+                        FRAME_TYPE_DATA | FRAME_TYPE_DATA_V2 => {
+                            match decode_data_frame(payload, frame_type) {
+                                Ok((transfer_id, file_index, offset, chunk)) => {
                                     match state_read
                                         .transfer_receiver
-                                        .signal_completion(id, total_bytes)
+                                        .receive_chunk(transfer_id, file_index, offset, chunk)
                                         .await
                                     {
                                         Ok(true) => {
+                                            tracing::info!(
+                                                "WS_HANDLER: Sending TransferFinalized for {}",
+                                                transfer_id
+                                            );
                                             // Finalized — send TransferFinalized back
-                                            let msg = ControlMessage::TransferFinalized { id };
+                                            let msg = ControlMessage::TransferFinalized {
+                                                id: transfer_id,
+                                            };
                                             let json = serde_json::to_string(&msg).unwrap();
                                             let _ = frame_tx_read
                                                 .send(encode_control_frame(json.as_bytes()));
                                         }
-                                        Ok(false) => {
-                                            // Waiting for remaining chunks; they will auto-finalize
-                                        }
+                                        Ok(false) => {}
                                         Err(e) => {
-                                            tracing::error!("Failed to signal completion: {}", e);
+                                            tracing::error!("Failed to write chunk: {}", e);
                                         }
                                     }
-                                    continue;
                                 }
-
-                                if let ControlMessage::TransferFinalized { id } = control_msg {
-                                    tracing::info!("Received TransferFinalized: {}", id);
-                                    let mut pending = state_read.pending_completions.lock().await;
-                                    if let Some(tx) = pending.remove(&id) {
-                                        let _ = tx.send(());
+                                Err(e) => {
+                                    tracing::error!("Failed to decode data frame: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        FRAME_TYPE_CONTROL => {
+                            let control_msg =
+                                match serde_json::from_slice::<ControlMessage>(payload) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to parse control message: {}",
+                                            e
+                                        );
+                                        continue;
                                     }
-                                    continue;
-                                }
+                                };
 
-                                if control_msg.is_request() {
-                                    tracing::debug!(
-                                        "Server handling request from client: {:?}",
-                                        control_msg
-                                    );
-                                    if let Some(response) = handle_server_to_server_request(
-                                        &state_read.clone(),
-                                        control_msg,
-                                    )
+                            if let ControlMessage::TransferComplete { id, total_bytes } =
+                                control_msg
+                            {
+                                tracing::info!(
+                                    "Received TransferComplete: {} ({} bytes)",
+                                    id,
+                                    total_bytes
+                                );
+                                match state_read
+                                    .transfer_receiver
+                                    .signal_completion(id, total_bytes)
                                     .await
-                                    {
-                                        let json = serde_json::to_string(&response).unwrap();
+                                {
+                                    Ok(true) => {
+                                        // Finalized — send TransferFinalized back
+                                        let msg = ControlMessage::TransferFinalized { id };
+                                        let json = serde_json::to_string(&msg).unwrap();
                                         let _ = frame_tx_read
                                             .send(encode_control_frame(json.as_bytes()));
                                     }
-                                } else {
-                                    // Response to one of our outgoing requests
-                                    let mut pending_lock = pending_read.lock().await;
-                                    if let Some(id) = pending_lock.keys().next().copied() {
-                                        if let Some(response_tx) = pending_lock.remove(&id) {
-                                            let _ = response_tx.send(control_msg);
-                                        }
+                                    Ok(false) => {
+                                        // Waiting for remaining chunks; they will auto-finalize
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to signal completion: {}", e);
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if let ControlMessage::TransferFinalized { id } = control_msg {
+                                tracing::info!("Received TransferFinalized: {}", id);
+                                let mut pending = state_read.pending_completions.lock().await;
+                                if let Some(tx) = pending.remove(&id) {
+                                    let _ = tx.send(());
+                                }
+                                continue;
+                            }
+
+                            if control_msg.is_request() {
+                                tracing::debug!(
+                                    "Server handling request from client: {:?}",
+                                    control_msg
+                                );
+                                if let Some(response) = handle_server_to_server_request(
+                                    &state_read.clone(),
+                                    control_msg,
+                                )
+                                .await
+                                {
+                                    let json = serde_json::to_string(&response).unwrap();
+                                    let _ = frame_tx_read
+                                        .send(encode_control_frame(json.as_bytes()));
+                                }
+                            } else {
+                                // Response to one of our outgoing requests
+                                let mut pending_lock = pending_read.lock().await;
+                                if let Some(id) = pending_lock.keys().next().copied() {
+                                    if let Some(response_tx) = pending_lock.remove(&id) {
+                                        let _ = response_tx.send(control_msg);
                                     }
                                 }
                             }
-                            other => {
-                                tracing::warn!("Unknown frame type: {:#x}", other);
-                            }
+                        }
+                        other => {
+                            tracing::warn!("Unknown frame type: {:#x}", other);
                         }
                     }
-                    // Handshake text frames only come before encryption — ignore any after
-                    Message::Text(_) => {}
-                    Message::Close(_) => break,
-                    _ => {}
+                }
+                // Handshake text frames only come before encryption — ignore any after
+                Message::Text(_) => {}
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Save any existing remote before overwriting.  This incoming connection
+    // may be either the primary peer (--target / /api/connect) or a transient
+    // CLI tool (ls / pull / send).  Both are server-to-server encrypted; the
+    // only way to distinguish them is by checking whether state.remote is
+    // already occupied.
+    //
+    // We *must* save-and-restore rather than skipping the overwrite, because
+    // the server-to-server request handler (handle_server_to_server_request)
+    // reads state.remote.frame_tx to route Pull data frames back to the
+    // requester.  If we left the original peer's frame_tx in place, Pull data
+    // would be sent to the wrong connection.
+    //
+    // The swap is done under a single write-lock so there is no window where
+    // state.remote is None — browser requests are never left without a peer.
+    let previous_remote = {
+        let mut remote = state.remote.write().await;
+        let prev = remote.take();
+        *remote = Some(RemoteConnection {
+            hostname: "remote".to_string(),
+            root_dir: "/".to_string(),
+            tx: request_tx.clone(),
+            frame_tx: frame_tx.clone(),
+            task_handles: vec![
+                request_handle.abort_handle(),
+                write_handle.abort_handle(),
+                read_handle.abort_handle(),
+            ],
+            peer_version,
+        });
+        prev
+    };
+    let _ = state
+        .browser_events
+        .send(ControlMessage::ConnectionStatus { has_remote: true });
+
+    // Send InfoRequest to get client's hostname and root_dir
+    let (info_tx, info_rx) = tokio::sync::oneshot::channel();
+    if request_tx
+        .send((ControlMessage::InfoRequest, info_tx))
+        .is_ok()
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(ControlMessage::InfoResponse { hostname, root_dir })) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await
+            {
+                let mut remote = state_clone.remote.write().await;
+                if let Some(ref mut remote_conn) = *remote {
+                    remote_conn.hostname = hostname;
+                    remote_conn.root_dir = root_dir;
                 }
             }
         });
-
-        // Save any existing remote before overwriting.  This incoming connection
-        // may be either the primary peer (--target / /api/connect) or a transient
-        // CLI tool (ls / pull / send).  Both are server-to-server encrypted; the
-        // only way to distinguish them is by checking whether state.remote is
-        // already occupied.
-        //
-        // We *must* save-and-restore rather than skipping the overwrite, because
-        // the server-to-server request handler (handle_server_to_server_request)
-        // reads state.remote.frame_tx to route Pull data frames back to the
-        // requester.  If we left the original peer's frame_tx in place, Pull data
-        // would be sent to the wrong connection.
-        //
-        // The swap is done under a single write-lock so there is no window where
-        // state.remote is None — browser requests are never left without a peer.
-        let previous_remote = {
-            let mut remote = state.remote.write().await;
-            let prev = remote.take();
-            *remote = Some(RemoteConnection {
-                hostname: "remote".to_string(),
-                root_dir: "/".to_string(),
-                tx: request_tx.clone(),
-                frame_tx: frame_tx.clone(),
-                task_handles: vec![
-                    request_handle.abort_handle(),
-                    write_handle.abort_handle(),
-                    read_handle.abort_handle(),
-                ],
-                peer_version,
-            });
-            prev
-        };
-        let _ = state
-            .browser_events
-            .send(ControlMessage::ConnectionStatus { has_remote: true });
-
-        // Send InfoRequest to get client's hostname and root_dir
-        let (info_tx, info_rx) = tokio::sync::oneshot::channel();
-        if request_tx
-            .send((ControlMessage::InfoRequest, info_tx))
-            .is_ok()
-        {
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                if let Ok(Ok(ControlMessage::InfoResponse { hostname, root_dir })) =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await
-                {
-                    let mut remote = state_clone.remote.write().await;
-                    if let Some(ref mut remote_conn) = *remote {
-                        remote_conn.hostname = hostname;
-                        remote_conn.root_dir = root_dir;
-                    }
-                }
-            });
-        }
-
-        tokio::select! {
-            _ = write_handle => {},
-            _ = read_handle => {},
-        }
-
-        // Restore the previous remote if one existed.  This connection was
-        // transient (CLI tool) and must not leave state.remote = None, which
-        // would break subsequent browser requests that forward through the
-        // persistent peer link.
-        let had_previous_remote = previous_remote.is_some();
-        {
-            let mut remote = state.remote.write().await;
-            if let Some(prev) = previous_remote {
-                *remote = Some(prev);
-            } else {
-                *remote = None;
-            }
-        }
-        // Only clear the fingerprint when the persistent peer itself disconnected.
-        // If we're restoring a prior connection, the fingerprint for that peer
-        // must remain so the browser UI continues to show it.
-        if !had_previous_remote {
-            *state.fingerprint.write().await = None;
-        }
-        let has_remote = state.remote.read().await.is_some();
-        let _ = state
-            .browser_events
-            .send(ControlMessage::ConnectionStatus { has_remote });
-
-        tracing::info!("Server-to-server connection closed");
-        return;
     }
 
+    tokio::select! {
+        _ = write_handle => {},
+        _ = read_handle => {},
+    }
+
+    // Restore the previous remote if one existed.  This connection was
+    // transient (CLI tool) and must not leave state.remote = None, which
+    // would break subsequent browser requests that forward through the
+    // persistent peer link.
+    let had_previous_remote = previous_remote.is_some();
+    {
+        let mut remote = state.remote.write().await;
+        if let Some(prev) = previous_remote {
+            *remote = Some(prev);
+        } else {
+            *remote = None;
+        }
+    }
+    // Only clear the fingerprint when the persistent peer itself disconnected.
+    // If we're restoring a prior connection, the fingerprint for that peer
+    // must remain so the browser UI continues to show it.
+    if !had_previous_remote {
+        *state.fingerprint.write().await = None;
+    }
+    let has_remote = state.remote.read().await.is_some();
+    let _ = state
+        .browser_events
+        .send(ControlMessage::ConnectionStatus { has_remote });
+
+    tracing::info!("Server-to-server connection closed");
+    return;
+}
+
+async fn handle_browser_connection(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    state: Arc<AppState>,
+    first_msg: &str,
+) {
     // ── Browser connection (plaintext) ─────────────────────────────────────────
     tracing::info!("Browser connection detected, using plaintext");
 

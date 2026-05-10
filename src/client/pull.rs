@@ -18,11 +18,12 @@ pub async fn pull_remote(
     output_dir: Option<&Path>,
     password: &Option<String>,
     allow_insecure_tls: bool,
+    no_encryption: bool,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = super::open_ws(target, allow_insecure_tls).await?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    let (crypto, fp, _) = perform_client_handshake(&mut ws_write, &mut ws_read, password).await?;
+    let (crypto, fp, _) = perform_client_handshake(&mut ws_write, &mut ws_read, password, no_encryption).await?;
     tracing::info!("Encrypted connection established (fingerprint: {})", fp);
 
     // Discover file metadata by browsing the parent directory

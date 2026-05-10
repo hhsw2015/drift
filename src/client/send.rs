@@ -21,6 +21,7 @@ pub async fn send_file(
     file_path: &Path,
     password: &Option<String>,
     allow_insecure_tls: bool,
+    no_encryption: bool,
 ) -> anyhow::Result<()> {
     let file_path = file_path.canonicalize()?;
     let file_name = file_path
@@ -49,7 +50,7 @@ pub async fn send_file(
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     let (crypto, fp, peer_version) =
-        perform_client_handshake(&mut ws_write, &mut ws_read, password).await?;
+        perform_client_handshake(&mut ws_write, &mut ws_read, password, no_encryption).await?;
     tracing::info!(
         "Encrypted connection established (fingerprint: {}), peer version: {:?}",
         fp,
