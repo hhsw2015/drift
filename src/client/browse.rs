@@ -24,7 +24,10 @@ pub async fn browse_remote(
     send_encrypted_control(
         &crypto,
         &mut ws_write,
-        &ControlMessage::BrowseRequest { path: browse_path },
+        &ControlMessage::BrowseRequest {
+            request_id: None,
+            path: browse_path,
+        },
     )
     .await?;
 
@@ -35,6 +38,7 @@ pub async fn browse_remote(
             hostname,
             cwd,
             entries,
+            ..
         } => {
             println!("{}:{}", hostname, cwd);
             if entries.is_empty() {
@@ -43,7 +47,7 @@ pub async fn browse_remote(
                 print_entries(&entries);
             }
         }
-        ControlMessage::Error { message } => {
+        ControlMessage::Error { message, .. } => {
             anyhow::bail!("{}", message);
         }
         other => {

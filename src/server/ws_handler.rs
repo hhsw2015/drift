@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
@@ -29,12 +29,11 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
 
     tracing::info!("New WebSocket connection");
-
-    use crate::crypto::stream::CryptoStream;
-
     let no_encryption = state.config.no_encryption;
 
-    // In no-encryption mode, send PlaintextMode instead of KeyExchange
+    use crate::crypto::handshake::KeyPair;
+    let server_keypair = KeyPair::generate();
+
     if no_encryption {
         let plaintext_msg = ControlMessage::PlaintextMode {
             protocol_version: Some(CURRENT_PROTOCOL_VERSION),
@@ -49,9 +48,6 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     } else {
-        // Send our public key first (server-to-server probe)
-        use crate::crypto::handshake::KeyPair;
-        let server_keypair = KeyPair::generate();
         let key_exchange = ControlMessage::KeyExchange {
             public_key: server_keypair.public_key_base64(),
             protocol_version: Some(CURRENT_PROTOCOL_VERSION),
@@ -65,117 +61,128 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
-
-        // Wait for first message to determine connection type
-        let first_msg = match receiver.next().await {
-            Some(Ok(Message::Text(text))) => text,
-            _ => return,
-        };
-
-        // KeyExchange response -> server-to-server encrypted connection
-        if let Ok(ControlMessage::KeyExchange {
-            public_key,
-            protocol_version,
-        }) = serde_json::from_str(&first_msg)
-        {
-            handle_encrypted_connection(
-                sender,
-                receiver,
-                state,
-                server_keypair,
-                &public_key,
-                protocol_version,
-            )
-            .await;
-            return;
-        }
-
-        // Not a KeyExchange -> browser connection (plaintext, handled below)
-        handle_browser_connection(sender, receiver, state, &first_msg).await;
-        return;
     }
 
-    // No-encryption mode: wait for first message to determine connection type
+    // Wait for first message to determine connection type
     let first_msg = match receiver.next().await {
         Some(Ok(Message::Text(text))) => text,
         _ => return,
     };
 
-    // In no-encryption mode, a server-to-server client won't send KeyExchange.
-    // We detect a JSON control message to decide if it's a server-to-server or browser.
-    // If it looks like a KeyExchange anyway (mismatch), we reject it.
-    if let Ok(ControlMessage::KeyExchange { .. }) = serde_json::from_str::<ControlMessage>(&first_msg) {
-        tracing::error!("Received KeyExchange from client but server is in --no-encryption mode");
-        let _ = sender
-            .send(Message::Text(
-                serde_json::to_string(&ControlMessage::Error {
-                    message: "Server is in plaintext mode, encryption not supported".into(),
-                })
-                .unwrap()
-                .into(),
-            ))
-            .await;
-        return;
-    }
+    // KeyExchange response → server-to-server encrypted connection
+    if let Ok(ControlMessage::KeyExchange {
+        public_key,
+        protocol_version,
+    }) = serde_json::from_str(&first_msg)
+    {
+        let connection_id = Uuid::new_v4();
+        let peer_version = protocol_version;
+        tracing::info!(
+            "Server-to-server connection detected, completing handshake (peer version: {:?})",
+            peer_version
+        );
 
-    // In plaintext mode, server-to-server connections proceed directly with no crypto.
-    // The client signals readiness by sending HandshakeComplete (or any non-browser message).
-    if let Ok(ControlMessage::HandshakeComplete) = serde_json::from_str::<ControlMessage>(&first_msg) {
-        let peer_version = Some(CURRENT_PROTOCOL_VERSION);
-        tracing::info!("Server-to-server plaintext connection established");
-
-        let crypto = Arc::new(CryptoStream::plaintext());
-        *state.fingerprint.write().await = Some("plaintext".to_string());
-
-        run_server_to_server_loop(sender, receiver, state, crypto, peer_version).await;
-        return;
-    }
-
-    // Otherwise, treat as browser connection
-    handle_browser_connection(sender, receiver, state, &first_msg).await;
-}
-
-/// Handle the encrypted server-to-server connection after receiving a KeyExchange from the client.
-async fn handle_encrypted_connection(
-    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    state: Arc<AppState>,
-    server_keypair: crate::crypto::handshake::KeyPair,
-    public_key: &str,
-    protocol_version: Option<u32>,
-) {
-    let peer_version = protocol_version;
-    tracing::info!(
-        "Server-to-server connection detected, completing handshake (peer version: {:?})",
-        peer_version
-    );
-
-    use crate::crypto::handshake::{
-        decode_public_key, derive_shared_secret, fingerprint, generate_nonce, verify_auth_proof,
-    };
-    use crate::crypto::stream::CryptoStream;
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
-    let client_public = match decode_public_key(public_key) {
-        Ok(pk) => pk,
-        Err(e) => {
-            tracing::error!("Invalid public key: {}", e);
-            return;
-        }
-    };
-
-    let shared_secret = derive_shared_secret(server_keypair.secret, &client_public);
-    let crypto = Arc::new(CryptoStream::from_shared_secret(&shared_secret, true));
-
-    // Password authentication: if configured, challenge the client
-    if let Some(ref password) = state.config.password {
-        let nonce = generate_nonce();
-        let challenge = ControlMessage::AuthChallenge {
-            nonce: BASE64.encode(&nonce),
+        use crate::crypto::handshake::{
+            decode_public_key, derive_shared_secret, fingerprint, generate_nonce, verify_auth_proof,
         };
+        use crate::crypto::stream::CryptoStream;
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+        let client_public = match decode_public_key(&public_key) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::error!("Invalid public key: {}", e);
+                return;
+            }
+        };
+
+        let shared_secret = derive_shared_secret(server_keypair.secret, &client_public);
+        let crypto = Arc::new(CryptoStream::from_shared_secret(&shared_secret, true));
+
+        // Password authentication: if configured, challenge the client
+        if let Some(ref password) = state.config.password {
+            let nonce = generate_nonce();
+            let challenge = ControlMessage::AuthChallenge {
+                nonce: BASE64.encode(&nonce),
+            };
+            if sender
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let proof_bytes = match receiver.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ControlMessage::AuthResponse { proof }) = serde_json::from_str(&text)
+                    {
+                        match BASE64.decode(&proof) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                tracing::error!("Invalid auth proof encoding");
+                                let _ = sender
+                                    .send(Message::Text(
+                                        serde_json::to_string(&ControlMessage::Error {
+                                            request_id: None,
+                                            message: "authentication failed".into(),
+                                        })
+                                        .unwrap()
+                                        .into(),
+                                    ))
+                                    .await;
+                                return;
+                            }
+                        }
+                    } else {
+                        tracing::error!(
+                            "Expected AuthResponse, got: {}",
+                            &text[..text.len().min(100)]
+                        );
+                        let _ = sender
+                            .send(Message::Text(
+                                serde_json::to_string(&ControlMessage::Error {
+                                    request_id: None,
+                                    message: "authentication failed".into(),
+                                })
+                                .unwrap()
+                                .into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+                _ => {
+                    tracing::error!("Connection closed during authentication");
+                    return;
+                }
+            };
+
+            if !verify_auth_proof(password, &nonce, &shared_secret, &proof_bytes) {
+                tracing::error!("Authentication failed: invalid password");
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&ControlMessage::Error {
+                            request_id: None,
+                            message: "authentication failed".into(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            }
+
+            tracing::info!("Password authentication successful");
+        }
+
         if sender
             .send(Message::Text(
-                serde_json::to_string(&challenge).unwrap().into(),
+                serde_json::to_string(&ControlMessage::HandshakeComplete)
+                    .unwrap()
+                    .into(),
             ))
             .await
             .is_err()
@@ -183,384 +190,349 @@ async fn handle_encrypted_connection(
             return;
         }
 
-        let proof_bytes = match receiver.next().await {
-            Some(Ok(Message::Text(text))) => {
-                if let Ok(ControlMessage::AuthResponse { proof }) = serde_json::from_str(&text)
-                {
-                    match BASE64.decode(&proof) {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            tracing::error!("Invalid auth proof encoding");
-                            let _ = sender
-                                .send(Message::Text(
-                                    serde_json::to_string(&ControlMessage::Error {
-                                        message: "authentication failed".into(),
-                                    })
-                                    .unwrap()
-                                    .into(),
-                                ))
-                                .await;
-                            return;
+        let fp = fingerprint(&shared_secret);
+        tracing::info!(
+            "Handshake complete, encrypted connection established (fingerprint: {})",
+            fp
+        );
+        *state.fingerprint.write().await = Some(fp);
+
+        // Single unified outbound channel: pre-encoded frames (type byte + payload).
+        // All outbound messages — data chunks AND control messages — go through this
+        // FIFO queue. The write task encrypts each frame and sends as a binary WS frame.
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Separate request channel for browser-forwarded requests needing responses
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<ControlMessage>();
+
+        let pending = Arc::new(Mutex::new(HashMap::<Uuid, ResponseChannel>::new()));
+        let pending_order = Arc::new(Mutex::new(VecDeque::<Uuid>::new()));
+        let pending_read = pending.clone();
+        let pending_order_read = pending_order.clone();
+
+        let crypto_write = crypto.clone();
+        let crypto_read = crypto.clone();
+        let state_read = state.clone();
+        let frame_tx_read = frame_tx.clone();
+
+        // Request handler: routes browser API requests to remote, tracks pending responses
+        let frame_tx_request = frame_tx.clone();
+        let request_handle = tokio::spawn(async move {
+            while let Some(msg) = request_rx.recv().await {
+                let json = serde_json::to_string(&msg).unwrap();
+                let _ = frame_tx_request.send(encode_control_frame(json.as_bytes()));
+            }
+        });
+
+        // Write task: encrypt each frame, send as binary WS frame
+        let write_handle = tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                match crypto_write.encrypt(&frame) {
+                    Ok(ciphertext) => {
+                        if sender
+                            .send(Message::Binary(ciphertext.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
                     }
-                } else {
-                    tracing::error!(
-                        "Expected AuthResponse, got: {}",
-                        &text[..text.len().min(100)]
-                    );
-                    let _ = sender
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::Error {
-                                message: "authentication failed".into(),
-                            })
-                            .unwrap()
-                            .into(),
-                        ))
-                        .await;
-                    return;
-                }
-            }
-            _ => {
-                tracing::error!("Connection closed during authentication");
-                return;
-            }
-        };
-
-        if !verify_auth_proof(password, &nonce, &shared_secret, &proof_bytes) {
-            tracing::error!("Authentication failed: invalid password");
-            let _ = sender
-                .send(Message::Text(
-                    serde_json::to_string(&ControlMessage::Error {
-                        message: "authentication failed".into(),
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await;
-            return;
-        }
-
-        tracing::info!("Password authentication successful");
-    }
-
-    if sender
-        .send(Message::Text(
-            serde_json::to_string(&ControlMessage::HandshakeComplete)
-                .unwrap()
-                .into(),
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let fp = fingerprint(&shared_secret);
-    tracing::info!(
-        "Handshake complete, encrypted connection established (fingerprint: {})",
-        fp
-    );
-    *state.fingerprint.write().await = Some(fp);
-
-    run_server_to_server_loop(sender, receiver, state, crypto, peer_version).await;
-}
-
-async fn run_server_to_server_loop(
-    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    state: Arc<AppState>,
-    crypto: Arc<crate::crypto::stream::CryptoStream>,
-    peer_version: Option<u32>,
-) {
-    // Single unified outbound channel: pre-encoded frames (type byte + payload).
-    // All outbound messages — data chunks AND control messages — go through this
-    // FIFO queue. The write task encrypts each frame and sends as a binary WS frame.
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-    // Separate request channel for browser-forwarded requests needing responses
-    let (request_tx, mut request_rx) =
-        mpsc::unbounded_channel::<(ControlMessage, ResponseChannel)>();
-
-    let pending = Arc::new(Mutex::new(HashMap::<Uuid, ResponseChannel>::new()));
-    let pending_request = pending.clone();
-    let pending_read = pending.clone();
-
-    let crypto_write = crypto.clone();
-    let crypto_read = crypto.clone();
-    let state_read = state.clone();
-    let frame_tx_read = frame_tx.clone();
-
-    // Request handler: routes browser API requests to remote, tracks pending responses
-    let frame_tx_request = frame_tx.clone();
-    let request_handle = tokio::spawn(async move {
-        while let Some((msg, response_tx)) = request_rx.recv().await {
-            let id = Uuid::new_v4();
-            pending_request.lock().await.insert(id, response_tx);
-            let json = serde_json::to_string(&msg).unwrap();
-            let _ = frame_tx_request.send(encode_control_frame(json.as_bytes()));
-        }
-    });
-
-    // Write task: encrypt each frame, send as binary WS frame
-    let write_handle = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            match crypto_write.encrypt(&frame) {
-                Ok(ciphertext) => {
-                    if sender
-                        .send(Message::Binary(ciphertext.into()))
-                        .await
-                        .is_err()
-                    {
+                    Err(e) => {
+                        tracing::error!("Encryption failed: {}", e);
                         break;
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Encryption failed: {}", e);
-                    break;
-                }
             }
-        }
-    });
+        });
 
-    // Read task: decrypt each binary frame, dispatch by type byte
-    let read_handle = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                Message::Binary(encrypted_data) => {
-                    let plaintext = match crypto_read.decrypt(&encrypted_data) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!("Decryption failed: {}", e);
-                            break;
-                        }
-                    };
+        // Read task: decrypt each binary frame, dispatch by type byte
+        let read_handle = tokio::spawn(async move {
+            while let Some(Ok(msg)) = receiver.next().await {
+                match msg {
+                    Message::Binary(encrypted_data) => {
+                        let plaintext = match crypto_read.decrypt(&encrypted_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!("Decryption failed: {}", e);
+                                break;
+                            }
+                        };
 
-                    let (frame_type, payload) = match decode_frame_type(&plaintext) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!("Frame decode failed: {}", e);
-                            break;
-                        }
-                    };
+                        let (frame_type, payload) = match decode_frame_type(&plaintext) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!("Frame decode failed: {}", e);
+                                break;
+                            }
+                        };
 
-                    match frame_type {
-                        FRAME_TYPE_DATA | FRAME_TYPE_DATA_V2 => {
-                            match decode_data_frame(payload, frame_type) {
-                                Ok((transfer_id, file_index, offset, chunk)) => {
+                        match frame_type {
+                            FRAME_TYPE_DATA | FRAME_TYPE_DATA_V2 => {
+                                match decode_data_frame(payload, frame_type) {
+                                    Ok((transfer_id, file_index, offset, chunk)) => {
+                                        match state_read
+                                            .transfer_receiver
+                                            .receive_chunk(transfer_id, file_index, offset, chunk)
+                                            .await
+                                        {
+                                            Ok(true) => {
+                                                tracing::info!(
+                                                    "WS_HANDLER: Sending TransferFinalized for {}",
+                                                    transfer_id
+                                                );
+                                                // Finalized — send TransferFinalized back
+                                                let msg = ControlMessage::TransferFinalized {
+                                                    id: transfer_id,
+                                                };
+                                                let json = serde_json::to_string(&msg).unwrap();
+                                                let _ = frame_tx_read
+                                                    .send(encode_control_frame(json.as_bytes()));
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => {
+                                                tracing::error!("Failed to write chunk: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to decode data frame: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            FRAME_TYPE_CONTROL => {
+                                let control_msg =
+                                    match serde_json::from_slice::<ControlMessage>(payload) {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to parse control message: {}",
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                if let ControlMessage::TransferComplete { id, total_bytes } =
+                                    control_msg
+                                {
+                                    tracing::info!(
+                                        "Received TransferComplete: {} ({} bytes)",
+                                        id,
+                                        total_bytes
+                                    );
                                     match state_read
                                         .transfer_receiver
-                                        .receive_chunk(transfer_id, file_index, offset, chunk)
+                                        .signal_completion(id, total_bytes)
                                         .await
                                     {
                                         Ok(true) => {
-                                            tracing::info!(
-                                                "WS_HANDLER: Sending TransferFinalized for {}",
-                                                transfer_id
-                                            );
                                             // Finalized — send TransferFinalized back
-                                            let msg = ControlMessage::TransferFinalized {
-                                                id: transfer_id,
-                                            };
+                                            let msg = ControlMessage::TransferFinalized { id };
                                             let json = serde_json::to_string(&msg).unwrap();
                                             let _ = frame_tx_read
                                                 .send(encode_control_frame(json.as_bytes()));
                                         }
-                                        Ok(false) => {}
+                                        Ok(false) => {
+                                            // Waiting for remaining chunks; they will auto-finalize
+                                        }
                                         Err(e) => {
-                                            tracing::error!("Failed to write chunk: {}", e);
+                                            tracing::error!("Failed to signal completion: {}", e);
                                         }
                                     }
+                                    continue;
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to decode data frame: {}", e);
-                                    break;
+
+                                if let ControlMessage::TransferFinalized { id } = control_msg {
+                                    tracing::info!("Received TransferFinalized: {}", id);
+                                    let mut pending = state_read.pending_completions.lock().await;
+                                    if let Some(tx) = pending.remove(&id) {
+                                        let _ = tx.send(Ok(()));
+                                    }
+                                    continue;
                                 }
-                            }
-                        }
-                        FRAME_TYPE_CONTROL => {
-                            let control_msg =
-                                match serde_json::from_slice::<ControlMessage>(payload) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to parse control message: {}",
-                                            e
-                                        );
+
+                                if let ControlMessage::TransferError { id, ref error } = control_msg {
+                                    tracing::error!("Received TransferError for {}: {}", id, error);
+                                    if state_read.handle_transfer_error(id, error).await {
                                         continue;
                                     }
-                                };
+                                    // No active transfer or pending completion — likely a
+                                    // synchronous rejection of a TransferRequest. Fall through
+                                    // to the generic response handler below.
+                                }
 
-                            if let ControlMessage::TransferComplete { id, total_bytes } =
-                                control_msg
-                            {
-                                tracing::info!(
-                                    "Received TransferComplete: {} ({} bytes)",
-                                    id,
-                                    total_bytes
-                                );
-                                match state_read
-                                    .transfer_receiver
-                                    .signal_completion(id, total_bytes)
+                                if control_msg.is_request() {
+                                    tracing::debug!(
+                                        "Server handling request from client: {:?}",
+                                        control_msg
+                                    );
+                                    if let Some(response) = handle_server_to_server_request(
+                                        &state_read.clone(),
+                                        control_msg,
+                                    )
                                     .await
-                                {
-                                    Ok(true) => {
-                                        // Finalized — send TransferFinalized back
-                                        let msg = ControlMessage::TransferFinalized { id };
-                                        let json = serde_json::to_string(&msg).unwrap();
+                                    {
+                                        let json = serde_json::to_string(&response).unwrap();
                                         let _ = frame_tx_read
                                             .send(encode_control_frame(json.as_bytes()));
                                     }
-                                    Ok(false) => {
-                                        // Waiting for remaining chunks; they will auto-finalize
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to signal completion: {}", e);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if let ControlMessage::TransferFinalized { id } = control_msg {
-                                tracing::info!("Received TransferFinalized: {}", id);
-                                let mut pending = state_read.pending_completions.lock().await;
-                                if let Some(tx) = pending.remove(&id) {
-                                    let _ = tx.send(());
-                                }
-                                continue;
-                            }
-
-                            if control_msg.is_request() {
-                                tracing::debug!(
-                                    "Server handling request from client: {:?}",
-                                    control_msg
-                                );
-                                if let Some(response) = handle_server_to_server_request(
-                                    &state_read.clone(),
-                                    control_msg,
-                                )
-                                .await
-                                {
-                                    let json = serde_json::to_string(&response).unwrap();
-                                    let _ = frame_tx_read
-                                        .send(encode_control_frame(json.as_bytes()));
-                                }
-                            } else {
-                                // Response to one of our outgoing requests
-                                let mut pending_lock = pending_read.lock().await;
-                                if let Some(id) = pending_lock.keys().next().copied() {
-                                    if let Some(response_tx) = pending_lock.remove(&id) {
-                                        let _ = response_tx.send(control_msg);
+                                } else {
+                                    // Response to one of our outgoing requests
+                                    let delivered = crate::server::deliver_pending_response(
+                                        &pending_read,
+                                        &pending_order_read,
+                                        control_msg.clone(),
+                                        peer_version,
+                                    )
+                                    .await;
+                                    if !delivered {
+                                        tracing::warn!("Unhandled control message: {:?}", control_msg);
                                     }
                                 }
                             }
-                        }
-                        other => {
-                            tracing::warn!("Unknown frame type: {:#x}", other);
+                            other => {
+                                tracing::warn!("Unknown frame type: {:#x}", other);
+                            }
                         }
                     }
+                    // Handshake text frames only come before encryption — ignore any after
+                    Message::Text(_) => {}
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                // Handshake text frames only come before encryption — ignore any after
-                Message::Text(_) => {}
-                Message::Close(_) => break,
-                _ => {}
             }
-        }
-    });
+        });
 
-    // Save any existing remote before overwriting.  This incoming connection
-    // may be either the primary peer (--target / /api/connect) or a transient
-    // CLI tool (ls / pull / send).  Both are server-to-server encrypted; the
-    // only way to distinguish them is by checking whether state.remote is
-    // already occupied.
-    //
-    // We *must* save-and-restore rather than skipping the overwrite, because
-    // the server-to-server request handler (handle_server_to_server_request)
-    // reads state.remote.frame_tx to route Pull data frames back to the
-    // requester.  If we left the original peer's frame_tx in place, Pull data
-    // would be sent to the wrong connection.
-    //
-    // The swap is done under a single write-lock so there is no window where
-    // state.remote is None — browser requests are never left without a peer.
-    let previous_remote = {
-        let mut remote = state.remote.write().await;
-        let prev = remote.take();
-        *remote = Some(RemoteConnection {
-            hostname: "remote".to_string(),
-            root_dir: "/".to_string(),
-            tx: request_tx.clone(),
-            frame_tx: frame_tx.clone(),
-            task_handles: vec![
-                request_handle.abort_handle(),
-                write_handle.abort_handle(),
-                read_handle.abort_handle(),
-            ],
+        // Save any existing remote before overwriting.  This incoming connection
+        // may be either the primary peer (--target / /api/connect) or a transient
+        // CLI tool (ls / pull / send).  Both are server-to-server encrypted; the
+        // only way to distinguish them is by checking whether state.remote is
+        // already occupied.
+        //
+        // We *must* save-and-restore rather than skipping the overwrite, because
+        // the server-to-server request handler (handle_server_to_server_request)
+        // reads state.remote.frame_tx to route Pull data frames back to the
+        // requester.  If we left the original peer's frame_tx in place, Pull data
+        // would be sent to the wrong connection.
+        //
+        // The swap is done under a single write-lock so there is no window where
+        // state.remote is None — browser requests are never left without a peer.
+        let mut previous_remote = {
+            let mut remote = state.remote.write().await;
+            let prev = remote.take();
+            *remote = Some(RemoteConnection {
+                instance_id: connection_id,
+                hostname: "remote".to_string(),
+                root_dir: "/".to_string(),
+                tx: request_tx.clone(),
+                pending_requests: pending.clone(),
+                pending_request_order: pending_order.clone(),
+                frame_tx: frame_tx.clone(),
+                task_handles: vec![
+                    request_handle.abort_handle(),
+                    write_handle.abort_handle(),
+                    read_handle.abort_handle(),
+                ],
+                peer_version,
+            });
+            prev
+        };
+        let _ = state
+            .browser_events
+            .send(ControlMessage::ConnectionStatus { has_remote: true });
+
+        // Send InfoRequest to get client's hostname and root_dir
+        let request_id = Uuid::new_v4();
+        let (info_tx, info_rx) = tokio::sync::oneshot::channel();
+        crate::server::register_pending_response(
+            &pending,
+            &pending_order,
+            request_id,
+            info_tx,
             peer_version,
-        });
-        prev
-    };
-    let _ = state
-        .browser_events
-        .send(ControlMessage::ConnectionStatus { has_remote: true });
-
-    // Send InfoRequest to get client's hostname and root_dir
-    let (info_tx, info_rx) = tokio::sync::oneshot::channel();
-    if request_tx
-        .send((ControlMessage::InfoRequest, info_tx))
-        .is_ok()
-    {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Ok(Ok(ControlMessage::InfoResponse { hostname, root_dir })) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await
-            {
-                let mut remote = state_clone.remote.write().await;
-                if let Some(ref mut remote_conn) = *remote {
-                    remote_conn.hostname = hostname;
-                    remote_conn.root_dir = root_dir;
+            true,
+        )
+        .await;
+        if request_tx
+            .send(ControlMessage::InfoRequest {
+                request_id: Some(request_id),
+            })
+            .is_ok()
+        {
+            let state_clone = state.clone();
+            let pending_cleanup = pending.clone();
+            let pending_order_cleanup = pending_order.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await {
+                    Ok(Ok(ControlMessage::InfoResponse {
+                        hostname, root_dir, ..
+                    })) => {
+                        let mut remote = state_clone.remote.write().await;
+                        if let Some(ref mut remote_conn) = *remote {
+                            if remote_conn.instance_id != connection_id {
+                                return;
+                            }
+                            remote_conn.hostname = hostname;
+                            remote_conn.root_dir = root_dir;
+                        }
+                    }
+                    _ => {
+                        let _ = crate::server::remove_pending_response(
+                            &pending_cleanup,
+                            &pending_order_cleanup,
+                            request_id,
+                        )
+                        .await;
+                    }
                 }
-            }
-        });
-    }
-
-    tokio::select! {
-        _ = write_handle => {},
-        _ = read_handle => {},
-    }
-
-    // Restore the previous remote if one existed.  This connection was
-    // transient (CLI tool) and must not leave state.remote = None, which
-    // would break subsequent browser requests that forward through the
-    // persistent peer link.
-    let had_previous_remote = previous_remote.is_some();
-    {
-        let mut remote = state.remote.write().await;
-        if let Some(prev) = previous_remote {
-            *remote = Some(prev);
+            });
         } else {
-            *remote = None;
+            let _ = crate::server::remove_pending_response(&pending, &pending_order, request_id)
+                .await;
         }
-    }
-    // Only clear the fingerprint when the persistent peer itself disconnected.
-    // If we're restoring a prior connection, the fingerprint for that peer
-    // must remain so the browser UI continues to show it.
-    if !had_previous_remote {
-        *state.fingerprint.write().await = None;
-    }
-    let has_remote = state.remote.read().await.is_some();
-    let _ = state
-        .browser_events
-        .send(ControlMessage::ConnectionStatus { has_remote });
 
-    tracing::info!("Server-to-server connection closed");
-    return;
-}
+        tokio::select! {
+            _ = write_handle => {},
+            _ = read_handle => {},
+        }
 
-async fn handle_browser_connection(
-    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    state: Arc<AppState>,
-    first_msg: &str,
-) {
+        // Restore the previous remote if one existed.  This connection was
+        // transient (CLI tool) and must not leave state.remote = None, which
+        // would break subsequent browser requests that forward through the
+        // persistent peer link.
+        let had_previous_remote = previous_remote.is_some();
+        let restored_previous = {
+            let mut remote = state.remote.write().await;
+            if remote.as_ref().map(|conn| conn.instance_id) == Some(connection_id) {
+                *remote = previous_remote.take();
+                true
+            } else {
+                false
+            }
+        };
+        if !restored_previous {
+            if let Some(prev) = previous_remote.take() {
+                crate::server::abort_remote_connection(prev).await;
+            }
+            tracing::info!("Server-to-server connection closed");
+            return;
+        }
+        {
+            let remote = state.remote.read().await;
+            if !had_previous_remote && remote.is_none() {
+                *state.fingerprint.write().await = None;
+            }
+        }
+        let has_remote = state.remote.read().await.is_some();
+        let _ = state
+            .browser_events
+            .send(ControlMessage::ConnectionStatus { has_remote });
+
+        tracing::info!("Server-to-server connection closed");
+        return;
+    }
+
     // ── Browser connection (plaintext) ─────────────────────────────────────────
     tracing::info!("Browser connection detected, using plaintext");
 
@@ -645,8 +617,7 @@ async fn handle_browser_message(
             id,
             entries,
             direction,
-            destination_path,
-            resume_hints,
+            destination_path, ..
         } => {
             tracing::info!(
                 "Browser TransferRequest: id={}, entries={}, direction={:?}, dest={}",
@@ -656,13 +627,12 @@ async fn handle_browser_message(
                 destination_path
             );
             tokio::spawn(async move {
-                browser_transfer::handle_browser_transfer_with_resume(
+                browser_transfer::handle_browser_transfer(
                     state,
                     id,
                     entries,
                     direction,
                     destination_path,
-                    resume_hints,
                     ws_tx,
                 )
                 .await;
@@ -683,7 +653,7 @@ async fn handle_server_to_server_request(
     msg: ControlMessage,
 ) -> Option<ControlMessage> {
     match msg {
-        ControlMessage::BrowseRequest { path } => {
+        ControlMessage::BrowseRequest { request_id, path } => {
             match crate::fileops::browse::list_directory(&state.config.root_dir, &path) {
                 Ok(entries) => {
                     let cwd = state
@@ -695,17 +665,20 @@ async fn handle_server_to_server_request(
                         .to_string_lossy()
                         .to_string();
                     Some(ControlMessage::BrowseResponse {
+                        request_id,
                         hostname: state.config.hostname.clone(),
                         cwd,
                         entries,
                     })
                 }
                 Err(e) => Some(ControlMessage::Error {
+                    request_id,
                     message: e.to_string(),
                 }),
             }
         }
-        ControlMessage::InfoRequest => Some(ControlMessage::InfoResponse {
+        ControlMessage::InfoRequest { request_id } => Some(ControlMessage::InfoResponse {
+            request_id,
             hostname: state.config.hostname.clone(),
             root_dir: state.config.root_dir.to_string_lossy().to_string(),
         }),
@@ -713,16 +686,14 @@ async fn handle_server_to_server_request(
             id,
             entries,
             direction,
-            destination_path,
-            resume_hints,
+            destination_path, ..
         } => {
             tracing::info!(
-                "Server received TransferRequest from client: id={}, entries={}, direction={:?}, dest={}, resume_hints={}",
+                "Server received TransferRequest from client: id={}, entries={}, direction={:?}, dest={}",
                 id,
                 entries.len(),
                 direction,
-                destination_path,
-                resume_hints.len(),
+                destination_path
             );
 
             use crate::protocol::messages::Direction;
@@ -732,10 +703,13 @@ async fn handle_server_to_server_request(
                         "Accepting push transfer, preparing to receive {} files",
                         entries.len()
                     );
-                    state
+                    if let Err(e) = state
                         .transfer_receiver
                         .start_transfer(id, entries.clone(), destination_path)
-                        .await;
+                        .await
+                    {
+                        return Some(ControlMessage::TransferError { id, error: e });
+                    }
                     Some(ControlMessage::TransferAccepted {
                         id,
                         resume_offsets: std::collections::HashMap::new(),
@@ -764,28 +738,25 @@ async fn handle_server_to_server_request(
                     };
 
                     let root_dir = state.config.root_dir.clone();
-                    let resume_offsets = resume_hints.clone();
                     tokio::spawn(async move {
-                        browser_transfer::send_entries_with_resume(
+                        browser_transfer::send_entries(
                             &root_dir,
                             id,
                             &entries,
                             &frame_tx,
                             peer_version,
-                            &resume_offsets,
                         )
                         .await;
                     });
 
-                    // Confirm the resume offsets back to the requester
                     Some(ControlMessage::TransferAccepted {
                         id,
-                        resume_offsets: resume_hints,
+                        resume_offsets: std::collections::HashMap::new(),
                     })
                 }
             }
         }
-        ControlMessage::Ping => Some(ControlMessage::Pong),
+        ControlMessage::Ping { request_id } => Some(ControlMessage::Pong { request_id }),
         _ => None,
     }
 }
@@ -794,41 +765,83 @@ async fn handle_server_to_server_request(
 /// BrowseRequest is NOT handled locally when there is no remote — it returns an error
 /// to prevent the remote panel from mirroring local files.
 async fn handle_control_message(state: &AppState, msg: ControlMessage) -> Option<ControlMessage> {
-    if !matches!(msg, ControlMessage::InfoRequest) {
+    if !matches!(msg, ControlMessage::InfoRequest { .. }) {
         let remote = state.remote.read().await;
         if let Some(ref remote_conn) = *remote {
+            let request_tx = remote_conn.tx.clone();
+            let pending_requests = remote_conn.pending_requests.clone();
+            let pending_request_order = remote_conn.pending_request_order.clone();
+            let peer_version = remote_conn.peer_version;
+            drop(remote);
+            let msg = if msg.is_request() && msg.request_id().is_none() {
+                msg.with_request_id(Uuid::new_v4())
+            } else {
+                msg
+            };
+            let request_id = msg.request_id();
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            if remote_conn.tx.send((msg.clone(), response_tx)).is_ok() {
+            if let Some(request_id) = request_id {
+                crate::server::register_pending_response(
+                    &pending_requests,
+                    &pending_request_order,
+                    request_id,
+                    response_tx,
+                    peer_version,
+                    true,
+                )
+                .await;
+            }
+            if request_tx.send(msg).is_ok() {
                 match tokio::time::timeout(std::time::Duration::from_secs(10), response_rx).await {
                     Ok(Ok(response)) => return Some(response),
                     Ok(Err(_)) => {
                         return Some(ControlMessage::Error {
+                            request_id,
                             message: "Remote connection lost".to_string(),
                         });
                     }
                     Err(_) => {
+                        if let Some(request_id) = request_id {
+                            let _ = crate::server::remove_pending_response(
+                                &pending_requests,
+                                &pending_request_order,
+                                request_id,
+                            )
+                            .await;
+                        }
                         return Some(ControlMessage::Error {
+                            request_id,
                             message: "Remote timeout".to_string(),
                         });
                     }
                 }
             }
+            if let Some(request_id) = request_id {
+                let _ = crate::server::remove_pending_response(
+                    &pending_requests,
+                    &pending_request_order,
+                    request_id,
+                )
+                .await;
+            }
             // tx.send failed: channel closed
             return Some(ControlMessage::Error {
+                request_id,
                 message: "Remote connection lost".to_string(),
             });
         }
 
         // No remote — BrowseRequest must not fall through to local handling
-        if matches!(msg, ControlMessage::BrowseRequest { .. }) {
+        if let ControlMessage::BrowseRequest { request_id, .. } = &msg {
             return Some(ControlMessage::Error {
+                request_id: *request_id,
                 message: "No remote connection".to_string(),
             });
         }
     }
 
     match msg {
-        ControlMessage::BrowseRequest { path } => {
+        ControlMessage::BrowseRequest { request_id, path } => {
             match crate::fileops::browse::list_directory(&state.config.root_dir, &path) {
                 Ok(entries) => {
                     let cwd = state
@@ -840,21 +853,24 @@ async fn handle_control_message(state: &AppState, msg: ControlMessage) -> Option
                         .to_string_lossy()
                         .to_string();
                     Some(ControlMessage::BrowseResponse {
+                        request_id,
                         hostname: state.config.hostname.clone(),
                         cwd,
                         entries,
                     })
                 }
                 Err(e) => Some(ControlMessage::Error {
+                    request_id,
                     message: e.to_string(),
                 }),
             }
         }
-        ControlMessage::InfoRequest => Some(ControlMessage::InfoResponse {
+        ControlMessage::InfoRequest { request_id } => Some(ControlMessage::InfoResponse {
+            request_id,
             hostname: state.config.hostname.clone(),
             root_dir: state.config.root_dir.to_string_lossy().to_string(),
         }),
-        ControlMessage::Ping => Some(ControlMessage::Pong),
+        ControlMessage::Ping { request_id } => Some(ControlMessage::Pong { request_id }),
         _ => None,
     }
 }

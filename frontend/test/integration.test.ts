@@ -1,16 +1,15 @@
 import { describe, it, beforeAll, afterAll, expect } from 'vitest';
 import * as path from 'path';
 import * as fs from 'fs';
-import { execSync } from 'child_process';
 import { getAvailablePort } from './helpers/ports.js';
 import { DriftProcess, runDriftCli } from './helpers/drift-process.js';
 import { WsBrowserClient } from './helpers/ws-client.js';
 import { computeAllChecksums } from './helpers/checksums.js';
+import { isolateTestResources, cleanupIsolatedTestResources } from './helpers/test-resources.js';
 import type { FileEntry } from '../src/types/protocol.js';
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../../');
-const TEST_RESOURCES = path.join(PROJECT_ROOT, 'test-resources');
-const TEST_RESOURCES_BAK = path.join(PROJECT_ROOT, 'test-resources-bak');
+const SHARED_TEST_RESOURCES = path.join(PROJECT_ROOT, 'test-resources');
 
 interface BrowseResponse {
   hostname: string;
@@ -132,34 +131,23 @@ function registerExitHandler() {
 }
 
 describe('drift integration', () => {
+  let testResources = SHARED_TEST_RESOURCES;
   beforeAll(async () => {
-    // Verify test-resources exists
-    if (!fs.existsSync(TEST_RESOURCES)) {
-      throw new Error(
-        'test-resources/ not found. Create test-resources/host/ (with a subdirectory) ' +
-        'and test-resources/client/ (with files) before running tests.'
-      );
-    }
-
-    // Backup test-resources before anything touches it
-    if (fs.existsSync(TEST_RESOURCES_BAK)) {
-      fs.rmSync(TEST_RESOURCES_BAK, { recursive: true, force: true });
-    }
-    execSync(`cp -a ${JSON.stringify(TEST_RESOURCES)} ${JSON.stringify(TEST_RESOURCES_BAK)}`);
+    testResources = isolateTestResources();
 
     // Snapshot initial checksums BEFORE any transfers
-    hostChecksums = await computeAllChecksums(path.join(TEST_RESOURCES, 'host'));
-    clientChecksums = await computeAllChecksums(path.join(TEST_RESOURCES, 'client'));
+    hostChecksums = await computeAllChecksums(path.join(testResources, 'host'));
+    clientChecksums = await computeAllChecksums(path.join(testResources, 'client'));
 
     // Allocate ports
     const hostPort = await getAvailablePort();
     const clientPort = await getAvailablePort();
 
     // Start drift instances
-    host = new DriftProcess({ port: hostPort, cwd: path.join(TEST_RESOURCES, 'host') });
+    host = new DriftProcess({ port: hostPort, cwd: path.join(testResources, 'host') });
     client = new DriftProcess({
       port: clientPort,
-      cwd: path.join(TEST_RESOURCES, 'client'),
+      cwd: path.join(testResources, 'client'),
       target: `127.0.0.1:${hostPort}`,
     });
 
@@ -185,16 +173,7 @@ describe('drift integration', () => {
 
   afterAll(async () => {
     await Promise.all([host?.stop(), client?.stop()]);
-
-    // Restore test-resources
-    try {
-      fs.rmSync(TEST_RESOURCES, { recursive: true, force: true });
-      if (fs.existsSync(TEST_RESOURCES_BAK)) {
-        fs.renameSync(TEST_RESOURCES_BAK, TEST_RESOURCES);
-      }
-    } catch (err) {
-      console.error('Failed to restore test-resources:', err);
-    }
+    cleanupIsolatedTestResources(testResources);
   }, 30_000);
 
   // Pull tests run first to avoid the frame channel being saturated by push data.
@@ -208,7 +187,7 @@ describe('drift integration', () => {
       ws.close();
     }
 
-    const clientDir = path.join(TEST_RESOURCES, 'client');
+    const clientDir = path.join(testResources, 'client');
     const clientAfter = await waitForChecksums(clientDir, hostChecksums);
     for (const [rel, md5] of hostChecksums) {
       expect(clientAfter.get(rel), `pull: host file "${rel}" missing from client`).toBe(md5);
@@ -223,7 +202,7 @@ describe('drift integration', () => {
       ws.close();
     }
 
-    const hostDir = path.join(TEST_RESOURCES, 'host');
+    const hostDir = path.join(testResources, 'host');
     const hostAfter = await waitForChecksums(hostDir, clientChecksums);
     for (const [rel, md5] of clientChecksums) {
       expect(hostAfter.get(rel), `pull: client file "${rel}" missing from host`).toBe(md5);
@@ -252,7 +231,7 @@ describe('drift integration', () => {
     // Files originally on host should now exist in client with matching MD5.
     // Poll briefly since the receiver may still be finalizing when TransferComplete fires.
     const clientAfter = await waitForChecksums(
-      path.join(TEST_RESOURCES, 'client'),
+      path.join(testResources, 'client'),
       hostChecksums,
     );
     for (const [rel, md5] of hostChecksums) {
@@ -261,7 +240,7 @@ describe('drift integration', () => {
 
     // Files originally on client should now exist in host with matching MD5.
     const hostAfter = await waitForChecksums(
-      path.join(TEST_RESOURCES, 'host'),
+      path.join(testResources, 'host'),
       clientChecksums,
     );
     for (const [rel, md5] of clientChecksums) {
@@ -313,7 +292,7 @@ describe('drift integration', () => {
       expect(fs.existsSync(pulledPath), `pulled file should exist at ${pulledPath}`).toBe(true);
 
       // Verify checksum matches the original
-      const originalChecksums = await computeAllChecksums(path.join(TEST_RESOURCES, 'host'));
+      const originalChecksums = await computeAllChecksums(path.join(testResources, 'host'));
       const pulledChecksums = await computeAllChecksums(tmpDir);
       const originalMd5 = originalChecksums.get(fileEntry.name);
       const pulledMd5 = pulledChecksums.get(fileEntry.name);
@@ -341,7 +320,7 @@ describe('drift integration', () => {
       expect(fs.existsSync(pulledPath), `pulled directory should exist at ${pulledPath}`).toBe(true);
 
       // Verify checksums of all files within the directory
-      const originalChecksums = await computeAllChecksums(path.join(TEST_RESOURCES, 'host', dirEntry.name));
+      const originalChecksums = await computeAllChecksums(path.join(testResources, 'host', dirEntry.name));
       const pulledChecksums = await computeAllChecksums(pulledPath);
       for (const [rel, md5] of originalChecksums) {
         expect(pulledChecksums.get(rel), `pulled file "${rel}" should match original`).toBe(md5);
@@ -413,7 +392,7 @@ describe('drift integration', () => {
     // Poll briefly in case finalize is still running.
     const deadline = Date.now() + 30_000;
     for (const side of ['host', 'client'] as const) {
-      const driftDir = path.join(TEST_RESOURCES, side, '.drift');
+      const driftDir = path.join(testResources, side, '.drift');
       while (Date.now() < deadline) {
         if (!fs.existsSync(driftDir) || fs.readdirSync(driftDir).length === 0) break;
         await new Promise((r) => setTimeout(r, 500));
@@ -436,7 +415,7 @@ describe('drift dynamic port and connection management', () => {
   let serverB: DriftProcess;
 
   beforeAll(async () => {
-    if (!fs.existsSync(TEST_RESOURCES)) {
+    if (!fs.existsSync(SHARED_TEST_RESOURCES)) {
       throw new Error('test-resources/ not found. See frontend/test/README.md.');
     }
   });
@@ -446,7 +425,7 @@ describe('drift dynamic port and connection management', () => {
   }, 15_000);
 
   it('starts on a dynamic port when --port is omitted', async () => {
-    serverA = new DriftProcess({ cwd: path.join(TEST_RESOURCES, 'host') });
+    serverA = new DriftProcess({ cwd: path.join(SHARED_TEST_RESOURCES, 'host') });
     await serverA.start();
 
     expect(serverA.port, 'port should be assigned by OS (> 0)').toBeGreaterThan(0);
@@ -459,7 +438,7 @@ describe('drift dynamic port and connection management', () => {
 
   it('connects to a remote via POST /api/connect', async () => {
     // Start serverB (no --target so it starts standalone)
-    serverB = new DriftProcess({ cwd: path.join(TEST_RESOURCES, 'client') });
+    serverB = new DriftProcess({ cwd: path.join(SHARED_TEST_RESOURCES, 'client') });
     await serverB.start();
 
     // Connect serverB → serverA via the REST API
@@ -530,7 +509,7 @@ describe('drift dynamic port and connection management', () => {
 
   it('can switch connections by calling /api/connect again', async () => {
     // Start a third server to switch to
-    const serverC = new DriftProcess({ cwd: path.join(TEST_RESOURCES, 'host') });
+    const serverC = new DriftProcess({ cwd: path.join(SHARED_TEST_RESOURCES, 'host') });
     await serverC.start();
 
     try {
@@ -562,7 +541,7 @@ describe('drift dynamic port and connection management', () => {
 });
 
 describe('password authentication', () => {
-  const hostDir = path.join(TEST_RESOURCES, 'host');
+  const hostDir = path.join(SHARED_TEST_RESOURCES, 'host');
   let hostPort: number;
   let clientPort: number;
   let hostProc: DriftProcess;
@@ -623,7 +602,7 @@ describe('password authentication', () => {
 });
 
 describe('--disable-ui flag', () => {
-  const hostDir = TEST_RESOURCES;
+  const hostDir = SHARED_TEST_RESOURCES;
   let hostProc: DriftProcess;
 
   afterAll(async () => {
@@ -952,4 +931,148 @@ describe('drift multi-entry transfer', () => {
       fs.rmSync(seedDir, { recursive: true, force: true });
     }
   }, 180_000);
+});
+
+// ── destination_path staging + validation ─────────────────────────────────────
+//
+// Feature coverage for the behavior change: the receiver stages its `.drift` temp
+// dir under the *destination* directory (so a read-only served root still works
+// when the destination is writable), removes the empty staging dir after finalize,
+// and rejects any `destination_path` that escapes the served root — both a
+// parent-traversal (`..`) path and an absolute path.
+
+describe('drift destination_path staging and validation', () => {
+  let hostProc: DriftProcess | null = null;
+  let clientProc: DriftProcess | null = null;
+  let tmpRoot: string;
+  let hostDir: string;
+  let clientDir: string;
+
+  beforeAll(async () => {
+    tmpRoot = fs.mkdtempSync('/tmp/drift-destval-');
+    hostDir = path.join(tmpRoot, 'host');
+    clientDir = path.join(tmpRoot, 'client');
+    // Host (remote) holds a folder + file to pull; client holds a file to push.
+    fs.mkdirSync(path.join(hostDir, 'pkg', 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(hostDir, 'doc.txt'), 'doc-body');
+    fs.writeFileSync(path.join(hostDir, 'pkg', 'nested', 'inner.txt'), 'inner-body');
+    fs.mkdirSync(clientDir, { recursive: true });
+    fs.writeFileSync(path.join(clientDir, 'cdoc.txt'), 'cdoc-body');
+
+    const hostPort = await getAvailablePort();
+    const clientPort = await getAvailablePort();
+    hostProc = new DriftProcess({ port: hostPort, cwd: hostDir });
+    clientProc = new DriftProcess({
+      port: clientPort,
+      cwd: clientDir,
+      target: `127.0.0.1:${hostPort}`,
+    });
+    await hostProc.start();
+    await clientProc.start();
+    await Promise.all([pollForRemote(hostProc.baseUrl), pollForRemote(clientProc.baseUrl)]);
+  }, 60_000);
+
+  afterAll(async () => {
+    await Promise.all([hostProc?.stop(), clientProc?.stop()]);
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }, 30_000);
+
+  function sendTransfer(
+    ws: WsBrowserClient,
+    direction: 'Pull' | 'Push',
+    relativePath: string,
+    destinationPath: string,
+    entry: FileEntry,
+  ): Promise<void> {
+    const id = crypto.randomUUID();
+    const done = ws.waitForTransferComplete(id, 60_000);
+    ws.send({
+      type: 'TransferRequest',
+      id,
+      entries: [{
+        relative_path: relativePath,
+        size: entry.size,
+        is_dir: entry.is_dir,
+        permissions: entry.permissions,
+      }],
+      direction,
+      destination_path: destinationPath,
+    });
+    return done;
+  }
+
+  it('pulls a folder into a destination subdir and stages .drift under it (not the root)', async () => {
+    const entry = (await browseEntries(hostProc!.baseUrl)).find((e) => e.name === 'pkg');
+    expect(entry, 'host should expose pkg/').toBeDefined();
+
+    const ws = await WsBrowserClient.connect(clientProc!.wsUrl);
+    try {
+      await sendTransfer(ws, 'Pull', 'pkg', 'sub', entry!);
+    } finally {
+      ws.close();
+    }
+
+    // For a pull, finalize (decompress + .drift cleanup) completes before the browser's
+    // TransferComplete fires, so this is already settled — but poll defensively to match
+    // the rest of the file and stay robust to any future reordering.
+    const innerPath = path.join(clientDir, 'sub', 'pkg', 'nested', 'inner.txt');
+    const stagingDir = path.join(clientDir, 'sub', '.drift');
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(innerPath) && !fs.existsSync(stagingDir)) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    // Files land under the destination subdir.
+    expect(fs.readFileSync(innerPath, 'utf-8')).toBe('inner-body');
+    // Staging happened under the destination, not the served root, and was cleaned up.
+    expect(fs.existsSync(path.join(clientDir, '.drift')), 'no .drift at served root').toBe(false);
+    expect(fs.existsSync(stagingDir), '.drift cleaned up under destination').toBe(false);
+  }, 60_000);
+
+  // Both validation branches: parent-traversal (`..`) and absolute. For the absolute
+  // case the destination_path is an absolute path to a sibling of the served root.
+  const escapeKinds = [
+    { label: 'a parent-traversal path (..)', kind: 'rel' as const },
+    { label: 'an absolute path', kind: 'abs' as const },
+  ];
+
+  it.each(escapeKinds)(
+    'rejects a Pull whose destination escapes the local root via $label',
+    async ({ kind }) => {
+      const entry = (await browseEntries(hostProc!.baseUrl)).find((e) => e.name === 'doc.txt');
+      expect(entry).toBeDefined();
+      const leaf = `escape-pull-${kind}`;
+      const target = path.join(tmpRoot, leaf); // clientDir/.. = tmpRoot
+      const dest = kind === 'abs' ? target : `../${leaf}`;
+
+      const ws = await WsBrowserClient.connect(clientProc!.wsUrl);
+      try {
+        await expect(sendTransfer(ws, 'Pull', 'doc.txt', dest, entry!)).rejects.toThrow();
+      } finally {
+        ws.close();
+      }
+      expect(fs.existsSync(target), `nothing written to ${target}`).toBe(false);
+    },
+    30_000,
+  );
+
+  it.each(escapeKinds)(
+    'rejects a Push whose destination escapes the remote root via $label',
+    async ({ kind }) => {
+      const entry = (await browseEntries(clientProc!.baseUrl)).find((e) => e.name === 'cdoc.txt');
+      expect(entry).toBeDefined();
+      const leaf = `escape-push-${kind}`;
+      const target = path.join(tmpRoot, leaf); // hostDir/.. = tmpRoot
+      const dest = kind === 'abs' ? target : `../${leaf}`;
+
+      const ws = await WsBrowserClient.connect(clientProc!.wsUrl);
+      try {
+        await expect(sendTransfer(ws, 'Push', 'cdoc.txt', dest, entry!)).rejects.toThrow();
+      } finally {
+        ws.close();
+      }
+      expect(fs.existsSync(target), `nothing written to ${target}`).toBe(false);
+    },
+    30_000,
+  );
 });

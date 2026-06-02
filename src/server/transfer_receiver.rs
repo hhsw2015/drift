@@ -20,12 +20,34 @@ pub struct ActiveTransfer {
     pub destination_path: String,
     /// Set when TransferComplete arrives, triggering auto-finalize in receive_chunk.
     expected_total: Option<u64>,
-    completion_tx: Option<oneshot::Sender<()>>,
+    completion_tx: Option<oneshot::Sender<Result<u64, String>>>,
 }
 
 pub struct TransferReceiver {
     root_dir: PathBuf,
     active_transfers: Arc<Mutex<HashMap<Uuid, ActiveTransfer>>>,
+}
+
+/// Reject destination paths that could escape `root_dir`. A legitimate
+/// `destination_path` is always a relative subpath produced by panel navigation
+/// (or `.`); an absolute path or any `..` component signals a traversal attempt
+/// from a malicious browser or peer. The check is lexical (no filesystem access)
+/// so it holds even when the target does not yet exist — closing the TOCTOU gap
+/// where validating only existing parents lets non-existent traversal targets through.
+fn validate_destination_path(destination_path: &str) -> Result<(), String> {
+    use std::path::Component;
+    for component in std::path::Path::new(destination_path).components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(format!(
+                "Invalid destination path (escapes root): {}",
+                destination_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl TransferReceiver {
@@ -41,7 +63,8 @@ impl TransferReceiver {
         id: Uuid,
         entries: Vec<TransferEntry>,
         destination_path: String,
-    ) {
+    ) -> Result<(), String> {
+        validate_destination_path(&destination_path)?;
         tracing::info!(
             "Starting to receive transfer: {} ({} entries) to {}",
             id,
@@ -64,6 +87,7 @@ impl TransferReceiver {
                 completion_tx: None,
             },
         );
+        Ok(())
     }
 
     /// Like `start_transfer` but returns a receiver that fires once `finalize_transfer` completes.
@@ -73,7 +97,8 @@ impl TransferReceiver {
         id: Uuid,
         entries: Vec<TransferEntry>,
         destination_path: String,
-    ) -> oneshot::Receiver<()> {
+    ) -> Result<oneshot::Receiver<Result<u64, String>>, String> {
+        validate_destination_path(&destination_path)?;
         tracing::info!(
             "Starting to receive transfer (with notify): {} ({} entries) to {}",
             id,
@@ -98,7 +123,7 @@ impl TransferReceiver {
             },
         );
 
-        rx
+        Ok(rx)
     }
 
     /// Write a chunk into the active transfer.
@@ -129,24 +154,27 @@ impl TransferReceiver {
                 .get(file_index as usize)
                 .ok_or_else(|| format!("Invalid file_index {} for transfer {}", file_index, id))?;
 
-            let file_path = if entry.is_dir {
-                // Directory: write to .drift/ temp directory as archive
-                let drift_dir = self.root_dir.join(".drift");
-                std::fs::create_dir_all(&drift_dir)
-                    .map_err(|e| format!("Failed to create .drift dir: {}", e))?;
-                drift_dir.join(format!("{}_{}.tar.gz", id, file_index))
+            // Stage temp files under the *destination* directory rather than the
+            // served root. The root may be read-only (e.g. drift launched from `/`)
+            // even when the chosen destination is writable. Co-locating `.drift` with
+            // the destination also keeps the temp file on the same filesystem as the
+            // final path, so the finalize rename stays atomic (no cross-device EXDEV).
+            let dest_dir = self.root_dir.join(&transfer.destination_path);
+            let drift_dir = dest_dir.join(".drift");
+
+            let (temp_path, final_path) = if entry.is_dir {
+                // Directory: stage archive in .drift/, finalize renames in-place
+                let archive = drift_dir.join(format!("{}_{}.tar.gz", id, file_index));
+                (archive.clone(), archive)
             } else {
-                // Regular file: write to destination directory using only the filename,
-                // not the full relative_path (which includes subdirectories from the sender side).
+                // Regular file: stage in .drift/, finalize moves to destination
                 let file_name = std::path::Path::new(&entry.relative_path)
                     .file_name()
                     .ok_or_else(|| format!("Invalid path: {}", entry.relative_path))?;
-                let dest_path = self
-                    .root_dir
-                    .join(&transfer.destination_path)
-                    .join(file_name);
 
-                // Validate that the path is within root_dir (path traversal protection)
+                let dest_path = dest_dir.join(file_name);
+
+                // Validate that the destination is within root_dir (path traversal protection)
                 let root_canonical = self
                     .root_dir
                     .canonicalize()
@@ -162,15 +190,20 @@ impl TransferReceiver {
                     }
                 }
 
-                dest_path
+                let temp = drift_dir.join(format!(
+                    "{}_{}_{}", id, file_index,
+                    file_name.to_string_lossy()
+                ));
+                (temp, dest_path)
             };
 
             tracing::info!(
-                "Creating writer for file_index={} at {:?}",
+                "Creating writer for file_index={}: temp={:?}, final={:?}",
                 file_index,
-                file_path
+                temp_path,
+                final_path
             );
-            let writer = ChunkedWriter::create(&file_path)
+            let writer = ChunkedWriter::create_with_temp(temp_path, final_path)
                 .await
                 .map_err(|e| format!("Failed to create writer: {}", e))?;
 
@@ -254,12 +287,53 @@ impl TransferReceiver {
             let has_dirs = transfer.has_dirs;
             let file_count = transfer.writers.len();
 
-            // Finalize all writers (take ownership from HashMap)
+            // Collect all potential temp paths and final destination paths for atomic rollback.
+            // We must collect these before draining transfer.writers.
+            let mut temp_paths = Vec::new();
+            let mut dest_paths = Vec::new();
+            for (&idx, writer) in &transfer.writers {
+                let entry = transfer.entries.get(idx as usize);
+                if entry.map(|e| e.is_dir).unwrap_or(false) {
+                    temp_paths.push(writer.temp_path().to_path_buf());
+                } else {
+                    temp_paths.push(writer.temp_path().to_path_buf());
+                    dest_paths.push(writer.final_path().to_path_buf());
+                }
+            }
+
+            // Ensure any directories that didn't have writers open are also handled
+            for (idx, entry) in transfer.entries.iter().enumerate() {
+                if entry.is_dir {
+                    let path = self.archive_path(&transfer.destination_path, id, idx);
+                    if !temp_paths.contains(&path) {
+                        temp_paths.push(path);
+                    }
+                }
+            }
+
+            // Finalize all writers (take ownership from HashMap).
+            // For regular files this renames .drift/temp → destination.
+            // For directories this is a no-op rename (archive stays in .drift/).
+            let mut finalize_failed = false;
+            let mut finalize_err = String::new();
             for (file_index, writer) in transfer.writers.drain() {
-                writer
-                    .finalize()
-                    .await
-                    .map_err(|e| format!("Failed to finalize file {}: {}", file_index, e))?;
+                if let Err(e) = writer.finalize().await {
+                    finalize_failed = true;
+                    finalize_err = format!("Failed to finalize file {}: {}", file_index, e);
+                    break;
+                }
+            }
+
+            if finalize_failed {
+                // Finalization failed — clean up all temp files and any successfully finalized files
+                let mut rollback_paths = temp_paths;
+                rollback_paths.extend(dest_paths);
+                Self::remove_files(rollback_paths).await;
+
+                if let Some(tx) = transfer.completion_tx.take() {
+                    let _ = tx.send(Err(finalize_err.clone()));
+                }
+                return Err(finalize_err);
             }
 
             tracing::info!(
@@ -289,34 +363,126 @@ impl TransferReceiver {
 
                 for (idx, entry) in transfer.entries.iter().enumerate() {
                     if entry.is_dir {
-                        let archive_path = self
-                            .root_dir
-                            .join(".drift")
-                            .join(format!("{}_{}.tar.gz", id, idx));
+                        let archive_path = self.archive_path(&transfer.destination_path, id, idx);
                         tracing::info!(
                             "Decompressing archive {:?} to {:?}",
                             archive_path,
                             dest_dir
                         );
-                        decompress::decompress_archive(&archive_path, &dest_dir).map_err(|e| {
-                            format!("Failed to decompress {}: {}", entry.relative_path, e)
-                        })?;
+                        if let Err(e) = decompress::decompress_archive(&archive_path, &dest_dir) {
+                            let err_msg = format!(
+                                "Failed to decompress {}: {}", entry.relative_path, e
+                            );
+
+                            // Decompression failed — clean up all temp files and any regular files already moved
+                            let mut rollback_paths = temp_paths;
+                            rollback_paths.extend(dest_paths);
+                            Self::remove_files(rollback_paths).await;
+
+                            if let Some(tx) = transfer.completion_tx.take() {
+                                let _ = tx.send(Err(err_msg.clone()));
+                            }
+                            return Err(err_msg);
+                        }
+
+                        // Archive consumed successfully — clean it up
+                        let _ = tokio::fs::remove_file(&archive_path).await;
                     }
                 }
             }
 
+            // Best-effort: remove the now-empty .drift staging dir from the
+            // destination. `remove_dir` only succeeds when the directory is empty,
+            // so concurrent transfers staging into the same dir are unaffected.
+            let _ = tokio::fs::remove_dir(
+                self.root_dir.join(&transfer.destination_path).join(".drift"),
+            )
+            .await;
+
             // Notify any waiters (e.g. Pull transfers waiting for completion)
             if let Some(tx) = transfer.completion_tx {
-                let _ = tx.send(());
+                let _ = tx.send(Ok(transfer.total_bytes_written));
             }
         }
 
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn abort_transfer(&self, id: Uuid) {
-        self.active_transfers.lock().await.remove(&id);
-        tracing::warn!("Transfer aborted: {}", id);
+    /// Path to the temporary tar.gz archive for a directory entry in a transfer.
+    /// Staged under the destination directory (see `receive_chunk`), not the served root.
+    fn archive_path(&self, destination_path: &str, id: Uuid, index: usize) -> std::path::PathBuf {
+        self.root_dir
+            .join(destination_path)
+            .join(".drift")
+            .join(format!("{}_{}.tar.gz", id, index))
+    }
+
+    /// Remove a list of files concurrently, logging warnings for unexpected errors.
+    /// NotFound is silently ignored (the file may never have been created).
+    async fn remove_files(paths: Vec<PathBuf>) {
+        let futs = paths.into_iter().map(|p| async move {
+            if let Err(e) = tokio::fs::remove_file(&p).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Cleanup: failed to remove {}: {}", p.display(), e);
+                }
+            }
+        });
+        futures_util::future::join_all(futs).await;
+    }
+
+    /// Signal that the sender encountered an error for this transfer.
+    /// Cleans up any partial state and notifies waiters with the error.
+    /// Returns true if an active transfer was found and removed.
+    pub async fn signal_error(&self, id: Uuid, error: String) -> bool {
+        let mut active = self.active_transfers.lock().await;
+        let Some(transfer) = active.remove(&id) else {
+            return false;
+        };
+        drop(active);
+
+        tracing::error!("Transfer error for {}: {}", id, error);
+
+        // Collect temp paths, then drop writers to release file handles before deletion.
+        let paths: Vec<PathBuf> = transfer
+            .writers
+            .into_iter()
+            .map(|(_, writer)| {
+                let p = writer.temp_path().to_path_buf();
+                drop(writer);
+                p
+            })
+            .collect();
+        Self::remove_files(paths).await;
+
+        if let Some(tx) = transfer.completion_tx {
+            let _ = tx.send(Err(error));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_destination_path;
+
+    #[test]
+    fn accepts_legitimate_relative_destinations() {
+        for p in [".", "sub", "a/b/c", "client-sub1/client-sub2"] {
+            assert!(validate_destination_path(p).is_ok(), "should accept {p:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_destinations() {
+        for p in [
+            "..",
+            "../escape",
+            "a/../../escape",
+            "sub/..",
+            "/etc/passwd",
+            "/",
+        ] {
+            assert!(validate_destination_path(p).is_err(), "should reject {p:?}");
+        }
     }
 }

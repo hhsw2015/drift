@@ -34,6 +34,7 @@ pub async fn pull_remote(
         &crypto,
         &mut ws_write,
         &ControlMessage::BrowseRequest {
+            request_id: None,
             path: parent.to_string(),
         },
     )
@@ -46,7 +47,7 @@ pub async fn pull_remote(
             .into_iter()
             .find(|e| e.name == file_name)
             .ok_or_else(|| anyhow::anyhow!("'{}' not found on remote", remote_path))?,
-        ControlMessage::Error { message } => {
+        ControlMessage::Error { message, .. } => {
             anyhow::bail!("Browse failed: {}", message);
         }
         other => {
@@ -178,11 +179,7 @@ async fn receive_transfer(
     write_path: &Path,
     resume_offset: u64,
 ) -> anyhow::Result<()> {
-    let mut writer = if resume_offset > 0 {
-        ChunkedWriter::create_with_resume(write_path, resume_offset).await?
-    } else {
-        ChunkedWriter::create(write_path).await?
-    };
+    let mut writer = ChunkedWriter::create(write_path).await?;
     let mut received: u64 = 0;
     let mut last_percent: u64 = 0;
 

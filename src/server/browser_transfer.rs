@@ -98,12 +98,17 @@ pub async fn handle_browser_transfer_with_resume(
     // Binary frames from the remote can arrive before TransferAccepted is processed,
     // so the receiver must be ready or chunks would be silently dropped (and lost).
     let pull_done_rx = if direction == Direction::Pull {
-        Some(
-            state
-                .transfer_receiver
-                .start_transfer_with_notify(id, entries.clone(), destination_path.clone())
-                .await,
-        )
+        match state
+            .transfer_receiver
+            .start_transfer_with_notify(id, entries.clone(), destination_path.clone())
+            .await
+        {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                send_error(&ws_tx, id, &e);
+                return;
+            }
+        }
     } else {
         None
     };
@@ -117,12 +122,30 @@ pub async fn handle_browser_transfer_with_resume(
         resume_hints: resume_hints.clone(),
     };
 
-    if let Some(ref remote_conn) = *remote {
-        if remote_conn.tx.send((request_msg, response_tx)).is_err() {
-            send_error(&ws_tx, id, "Failed to send to remote");
-            return;
-        }
+    let remote_conn = remote.as_ref().expect("checked above");
+    crate::server::register_pending_response(
+        &remote_conn.pending_requests,
+        &remote_conn.pending_request_order,
+        id,
+        response_tx,
+        remote_conn.peer_version,
+        false,
+    )
+    .await;
+    if remote_conn.tx.send(request_msg).is_err() {
+        let _ = crate::server::remove_pending_response(
+            &remote_conn.pending_requests,
+            &remote_conn.pending_request_order,
+            id,
+        )
+        .await;
+        send_error(&ws_tx, id, "Failed to send to remote");
+        return;
     }
+    let (pending_requests, pending_request_order) = (
+        remote_conn.pending_requests.clone(),
+        remote_conn.pending_request_order.clone(),
+    );
     drop(remote);
 
     // 60s timeout: TransferAccepted may be delayed if data from a prior transfer
@@ -149,23 +172,26 @@ pub async fn handle_browser_transfer_with_resume(
                 Direction::Pull => {
                     let done_rx = pull_done_rx.expect("pull_done_rx set above for Pull");
 
-                    match tokio::time::timeout(std::time::Duration::from_secs(1800), done_rx).await
-                    {
-                        Ok(Ok(())) => {
+                    let wait_result = tokio::time::timeout(std::time::Duration::from_secs(1800), done_rx).await;
+                    match wait_result {
+                        Err(_) => send_error(&ws_tx, id, "Pull transfer timed out"),
+                        Ok(Err(_recv_err)) => {
+                            send_error(&ws_tx, id, "Pull transfer channel closed unexpectedly")
+                        }
+                        Ok(Ok(Err(error))) => {
+                            send_error(&ws_tx, id, &error);
+                        }
+                        Ok(Ok(Ok(total_bytes))) => {
                             tracing::info!("Pull transfer complete: {}", id);
                             let _ = ws_tx.send(Message::Text(
                                 serde_json::to_string(&ControlMessage::TransferComplete {
                                     id,
-                                    total_bytes: 0,
+                                    total_bytes,
                                 })
                                 .unwrap()
                                 .into(),
                             ));
                         }
-                        Ok(Err(_)) => {
-                            send_error(&ws_tx, id, "Pull transfer channel closed unexpectedly")
-                        }
-                        Err(_) => send_error(&ws_tx, id, "Pull transfer timed out"),
                     }
                 }
             }
@@ -173,7 +199,15 @@ pub async fn handle_browser_transfer_with_resume(
         Ok(Ok(ControlMessage::TransferError { error, .. })) => send_error(&ws_tx, id, &error),
         Ok(Ok(_)) => send_error(&ws_tx, id, "Unexpected response from remote"),
         Ok(Err(_)) => send_error(&ws_tx, id, "Remote response channel closed"),
-        Err(_) => send_error(&ws_tx, id, "Remote response timeout"),
+        Err(_) => {
+            let _ = crate::server::remove_pending_response(
+                &pending_requests,
+                &pending_request_order,
+                id,
+            )
+            .await;
+            send_error(&ws_tx, id, "Remote response timeout");
+        }
     }
 }
 
@@ -512,7 +546,7 @@ async fn push_entries(
 
     // Register completion waiter BEFORE sending any data, so TransferFinalized
     // cannot arrive and be missed between sending TransferComplete and registering.
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     state.pending_completions.lock().await.insert(id, done_tx);
 
     for (file_idx, (display_name, file_path, _file_size, _cleanup, resume_offset)) in
@@ -571,8 +605,23 @@ async fn push_entries(
     );
 
     // Wait for the remote to confirm receipt before telling the browser
-    match tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await {
-        Ok(Ok(())) => {
+    let wait_result = tokio::time::timeout(std::time::Duration::from_secs(300), done_rx).await;
+    match wait_result {
+        Err(_) => {
+            state.pending_completions.lock().await.remove(&id);
+            send_error(
+                ws_tx,
+                id,
+                "Remote did not confirm transfer within 5 minutes",
+            );
+        }
+        Ok(Err(_recv_err)) => {
+            send_error(ws_tx, id, "Remote completion channel closed unexpectedly");
+        }
+        Ok(Ok(Err(error))) => {
+            send_error(ws_tx, id, &error);
+        }
+        Ok(Ok(Ok(()))) => {
             tracing::info!("Push verified complete: {} ({} bytes)", id, total_sent);
             let _ = ws_tx.send(Message::Text(
                 serde_json::to_string(&ControlMessage::TransferComplete {
@@ -582,17 +631,6 @@ async fn push_entries(
                 .unwrap()
                 .into(),
             ));
-        }
-        Ok(Err(_)) => {
-            send_error(ws_tx, id, "Remote completion channel closed unexpectedly");
-        }
-        Err(_) => {
-            state.pending_completions.lock().await.remove(&id);
-            send_error(
-                ws_tx,
-                id,
-                "Remote did not confirm transfer within 5 minutes",
-            );
         }
     }
 

@@ -1,9 +1,11 @@
 use axum::{
     Json,
     extract::{Query, State},
+    http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::fileops::browse;
 use crate::protocol::messages::{ControlMessage, FileEntry};
@@ -47,6 +49,77 @@ pub async fn browse(
         cwd,
         entries,
     }))
+}
+
+pub async fn browse_remote(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BrowseParams>,
+) -> Result<Json<BrowseResponse>, StatusCode> {
+    let request_id = Uuid::new_v4();
+    let (response_rx, pending_requests, pending_request_order) = {
+        let remote = state.remote.read().await;
+        let remote_conn = remote.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let msg = ControlMessage::BrowseRequest {
+            request_id: Some(request_id),
+            path: params.path.clone(),
+        };
+        crate::server::register_pending_response(
+            &remote_conn.pending_requests,
+            &remote_conn.pending_request_order,
+            request_id,
+            response_tx,
+            remote_conn.peer_version,
+            true,
+        )
+        .await;
+        if remote_conn.tx.send(msg).is_err() {
+            let _ = crate::server::remove_pending_response(
+                &remote_conn.pending_requests,
+                &remote_conn.pending_request_order,
+                request_id,
+            )
+            .await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        (
+            response_rx,
+            remote_conn.pending_requests.clone(),
+            remote_conn.pending_request_order.clone(),
+        )
+    }; // lock released here
+
+    match tokio::time::timeout(std::time::Duration::from_secs(10), response_rx).await {
+        Ok(Ok(ControlMessage::BrowseResponse {
+            request_id: response_id,
+            hostname,
+            cwd,
+            entries,
+        })) if response_id.is_none() || response_id == Some(request_id) => Ok(Json(BrowseResponse {
+            hostname,
+            cwd,
+            entries,
+        })),
+        Ok(Ok(ControlMessage::Error {
+            request_id: response_id,
+            message,
+        })) if response_id.is_none() || response_id == Some(request_id) => {
+            tracing::warn!("Remote browse error: {}", message);
+            Err(StatusCode::BAD_GATEWAY)
+        }
+        Ok(Ok(_)) => Err(StatusCode::BAD_GATEWAY),
+        Ok(Err(_)) => Err(StatusCode::BAD_GATEWAY),
+        Err(_) => {
+            let _ = crate::server::remove_pending_response(
+                &pending_requests,
+                &pending_request_order,
+                request_id,
+            )
+            .await;
+            Err(StatusCode::GATEWAY_TIMEOUT)
+        }
+    }
 }
 
 #[derive(Serialize)]

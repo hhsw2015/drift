@@ -5,8 +5,10 @@ use uuid::Uuid;
 /// Current protocol version. Increment when making backward-incompatible changes.
 /// Version 1: Original format (no file_index in frames)
 /// Version 2: Added file_index to data frames for multi-file transfers
-pub const CURRENT_PROTOCOL_VERSION: u32 = 2;
+/// Version 3: Correlated request/response ids for browse/info/ping
+pub const CURRENT_PROTOCOL_VERSION: u32 = 3;
 pub const MIN_MULTI_FILE_VERSION: u32 = 2;
+pub const MIN_REQUEST_ID_VERSION: u32 = 3;
 
 fn default_destination() -> String {
     ".".to_string()
@@ -35,17 +37,26 @@ pub enum ControlMessage {
 
     // Browsing
     BrowseRequest {
+        #[serde(default)]
+        request_id: Option<Uuid>,
         path: String,
     },
     BrowseResponse {
+        #[serde(default)]
+        request_id: Option<Uuid>,
         hostname: String,
         cwd: String,
         entries: Vec<FileEntry>,
     },
 
     // Info
-    InfoRequest,
+    InfoRequest {
+        #[serde(default)]
+        request_id: Option<Uuid>,
+    },
     InfoResponse {
+        #[serde(default)]
+        request_id: Option<Uuid>,
         hostname: String,
         root_dir: String,
     },
@@ -88,9 +99,17 @@ pub enum ControlMessage {
     ConnectionStatus {
         has_remote: bool,
     },
-    Ping,
-    Pong,
+    Ping {
+        #[serde(default)]
+        request_id: Option<Uuid>,
+    },
+    Pong {
+        #[serde(default)]
+        request_id: Option<Uuid>,
+    },
     Error {
+        #[serde(default)]
+        request_id: Option<Uuid>,
         message: String,
     },
 }
@@ -130,9 +149,57 @@ impl ControlMessage {
         matches!(
             self,
             ControlMessage::BrowseRequest { .. }
-                | ControlMessage::InfoRequest
+                | ControlMessage::InfoRequest { .. }
                 | ControlMessage::TransferRequest { .. }
-                | ControlMessage::Ping
+                | ControlMessage::Ping { .. }
         )
+    }
+
+    /// Correlation id used to track an outgoing request.
+    pub fn request_id(&self) -> Option<Uuid> {
+        match self {
+            ControlMessage::BrowseRequest { request_id, .. }
+            | ControlMessage::InfoRequest { request_id }
+            | ControlMessage::Ping { request_id } => *request_id,
+            ControlMessage::TransferRequest { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Correlation id used to route a response to its waiting caller.
+    pub fn response_id(&self) -> Option<Uuid> {
+        match self {
+            ControlMessage::BrowseResponse { request_id, .. }
+            | ControlMessage::InfoResponse { request_id, .. }
+            | ControlMessage::Pong { request_id }
+            | ControlMessage::Error { request_id, .. } => *request_id,
+            ControlMessage::TransferAccepted { id, .. }
+            | ControlMessage::TransferError { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Inject a correlation id into request variants that do not already have one.
+    pub fn with_request_id(self, request_id: Uuid) -> Self {
+        match self {
+            ControlMessage::BrowseRequest {
+                request_id: existing,
+                path,
+            } => ControlMessage::BrowseRequest {
+                request_id: existing.or(Some(request_id)),
+                path,
+            },
+            ControlMessage::InfoRequest {
+                request_id: existing,
+            } => ControlMessage::InfoRequest {
+                request_id: existing.or(Some(request_id)),
+            },
+            ControlMessage::Ping {
+                request_id: existing,
+            } => ControlMessage::Ping {
+                request_id: existing.or(Some(request_id)),
+            },
+            other => other,
+        }
     }
 }

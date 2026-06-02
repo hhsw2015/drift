@@ -26,6 +26,7 @@
 - End-to-end encryption via X25519 key exchange + ChaCha20-Poly1305
 - Optional password authentication
 - Two-pane file browser UI (`hostname:/pwd` on each side) with multi-select (Cmd/Ctrl-click to toggle, Shift-click to range-select)
+- Address bar with autocomplete — type paths and get suggestions for local and remote directories
 - Large file support with chunked streaming and progress indication
 - Recursive directory transfer (auto-compressed via tar.gz)
 - Direct CLI file send mode (`--file`) — no web UI needed
@@ -158,6 +159,8 @@ drift prioritizes maximum compatibility and zero configuration:
 |---|---|---|
 | Text (encrypted) | JSON `ControlMessage` | Browse, transfer control, progress |
 | Binary (encrypted) | `[16B UUID][8B offset][chunk]` | File data |
+
+Request/response control messages such as browse and info use correlation IDs so concurrent requests can be matched to the correct reply even if responses arrive out of order or a caller times out.
 
 ### Security
 

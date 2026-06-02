@@ -162,8 +162,9 @@ use crate::protocol::codec::{
     encode_control_frame,
 };
 use crate::protocol::messages::{CURRENT_PROTOCOL_VERSION, ControlMessage};
-use crate::server::{AppState, RemoteConnection, ResponseChannel};
+use crate::server::{AppState, PendingResponseOrder, RemoteConnection, ResponseChannel};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::VecDeque;
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -234,6 +235,7 @@ pub async fn connect_to_remote(
     no_encryption: bool,
     state: Arc<AppState>,
 ) -> anyhow::Result<()> {
+    let connection_id = Uuid::new_v4();
     let (ws_stream, _) = open_ws(target, allow_insecure_tls).await?;
     tracing::info!("Connected to remote: {}", target);
 
@@ -266,12 +268,12 @@ pub async fn connect_to_remote(
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Separate request channel for forwarded browser API requests
-    let (request_tx, mut request_rx) =
-        mpsc::unbounded_channel::<(ControlMessage, ResponseChannel)>();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<ControlMessage>();
 
     let pending = Arc::new(Mutex::new(HashMap::<Uuid, ResponseChannel>::new()));
-    let pending_request = pending.clone();
+    let pending_order: PendingResponseOrder = Arc::new(Mutex::new(VecDeque::new()));
     let pending_read = pending.clone();
+    let pending_order_read = pending_order.clone();
     let crypto_write = crypto.clone();
     let crypto_read = crypto.clone();
     let state_read = state.clone();
@@ -280,9 +282,7 @@ pub async fn connect_to_remote(
     // Request handler: tracks pending responses
     let frame_tx_request = frame_tx.clone();
     let request_handle = tokio::spawn(async move {
-        while let Some((msg, response_tx)) = request_rx.recv().await {
-            let id = Uuid::new_v4();
-            pending_request.lock().await.insert(id, response_tx);
+        while let Some(msg) = request_rx.recv().await {
             let json = serde_json::to_string(&msg).unwrap();
             let _ = frame_tx_request.send(encode_control_frame(json.as_bytes()));
         }
@@ -404,9 +404,19 @@ pub async fn connect_to_remote(
                                 tracing::info!("Received TransferFinalized: {}", id);
                                 let mut pending = state_read.pending_completions.lock().await;
                                 if let Some(tx) = pending.remove(&id) {
-                                    let _ = tx.send(());
+                                    let _ = tx.send(Ok(()));
                                 }
                                 continue;
+                            }
+
+                            if let ControlMessage::TransferError { id, ref error } = control_msg {
+                                tracing::error!("Received TransferError for {}: {}", id, error);
+                                if state_read.handle_transfer_error(id, error).await {
+                                    continue;
+                                }
+                                // No active transfer or pending completion — likely a
+                                // synchronous rejection of a TransferRequest. Fall through
+                                // to the generic response handler below.
                             }
 
                             if control_msg.is_request() {
@@ -422,11 +432,15 @@ pub async fn connect_to_remote(
                                         frame_tx_read.send(encode_control_frame(json.as_bytes()));
                                 }
                             } else {
-                                let mut pending_lock = pending_read.lock().await;
-                                if let Some(id) = pending_lock.keys().next().copied() {
-                                    if let Some(response_tx) = pending_lock.remove(&id) {
-                                        let _ = response_tx.send(control_msg);
-                                    }
+                                let delivered = crate::server::deliver_pending_response(
+                                    &pending_read,
+                                    &pending_order_read,
+                                    control_msg.clone(),
+                                    peer_version,
+                                )
+                                .await;
+                                if !delivered {
+                                    tracing::warn!("Unhandled control message: {:?}", control_msg);
                                 }
                             }
                         }
@@ -447,9 +461,12 @@ pub async fn connect_to_remote(
     {
         let mut remote = state.remote.write().await;
         *remote = Some(RemoteConnection {
+            instance_id: connection_id,
             hostname: target.to_string(),
             root_dir: "/".to_string(),
             tx: request_tx.clone(),
+            pending_requests: pending.clone(),
+            pending_request_order: pending_order.clone(),
             frame_tx: frame_tx.clone(),
             task_handles: vec![
                 request_handle.abort_handle(),
@@ -464,20 +481,43 @@ pub async fn connect_to_remote(
         .send(ControlMessage::ConnectionStatus { has_remote: true });
 
     // Send InfoRequest to get remote hostname and root_dir
+    let request_id = Uuid::new_v4();
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
+    crate::server::register_pending_response(
+        &pending,
+        &pending_order,
+        request_id,
+        info_tx,
+        peer_version,
+        true,
+    )
+    .await;
     if request_tx
-        .send((ControlMessage::InfoRequest, info_tx))
+        .send(ControlMessage::InfoRequest {
+            request_id: Some(request_id),
+        })
         .is_ok()
     {
-        if let Ok(Ok(ControlMessage::InfoResponse { hostname, root_dir })) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await
-        {
-            let mut remote = state.remote.write().await;
-            if let Some(ref mut remote_conn) = *remote {
-                remote_conn.hostname = hostname;
-                remote_conn.root_dir = root_dir;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), info_rx).await {
+            Ok(Ok(ControlMessage::InfoResponse {
+                hostname, root_dir, ..
+            })) => {
+                let mut remote = state.remote.write().await;
+                if let Some(ref mut remote_conn) = *remote {
+                    if remote_conn.instance_id == connection_id {
+                        remote_conn.hostname = hostname;
+                        remote_conn.root_dir = root_dir;
+                    }
+                }
+            }
+            _ => {
+                let _ =
+                    crate::server::remove_pending_response(&pending, &pending_order, request_id)
+                        .await;
             }
         }
+    } else {
+        let _ = crate::server::remove_pending_response(&pending, &pending_order, request_id).await;
     }
 
     tokio::select! {
@@ -485,13 +525,11 @@ pub async fn connect_to_remote(
         _ = read_handle => {},
     }
 
-    {
-        let mut remote = state.remote.write().await;
-        *remote = None;
+    if crate::server::clear_remote_if_instance(&state, connection_id).await {
+        let _ = state
+            .browser_events
+            .send(ControlMessage::ConnectionStatus { has_remote: false });
     }
-    let _ = state
-        .browser_events
-        .send(ControlMessage::ConnectionStatus { has_remote: false });
 
     Ok(())
 }
@@ -501,7 +539,7 @@ async fn handle_incoming_request(
     msg: ControlMessage,
 ) -> Option<ControlMessage> {
     match msg {
-        ControlMessage::BrowseRequest { path } => {
+        ControlMessage::BrowseRequest { request_id, path } => {
             match crate::fileops::browse::list_directory(&state.config.root_dir, &path) {
                 Ok(entries) => {
                     let cwd = state
@@ -513,17 +551,20 @@ async fn handle_incoming_request(
                         .to_string_lossy()
                         .to_string();
                     Some(ControlMessage::BrowseResponse {
+                        request_id,
                         hostname: state.config.hostname.clone(),
                         cwd,
                         entries,
                     })
                 }
                 Err(e) => Some(ControlMessage::Error {
+                    request_id,
                     message: e.to_string(),
                 }),
             }
         }
-        ControlMessage::InfoRequest => Some(ControlMessage::InfoResponse {
+        ControlMessage::InfoRequest { request_id } => Some(ControlMessage::InfoResponse {
+            request_id,
             hostname: state.config.hostname.clone(),
             root_dir: state.config.root_dir.to_string_lossy().to_string(),
         }),
@@ -546,10 +587,13 @@ async fn handle_incoming_request(
             use crate::protocol::messages::Direction;
             match direction {
                 Direction::Push => {
-                    state
+                    if let Err(e) = state
                         .transfer_receiver
                         .start_transfer(id, entries.clone(), destination_path)
-                        .await;
+                        .await
+                    {
+                        return Some(ControlMessage::TransferError { id, error: e });
+                    }
                     Some(ControlMessage::TransferAccepted {
                         id,
                         resume_offsets: std::collections::HashMap::new(),
@@ -599,7 +643,7 @@ async fn handle_incoming_request(
                 }
             }
         }
-        ControlMessage::Ping => Some(ControlMessage::Pong),
+        ControlMessage::Ping { request_id } => Some(ControlMessage::Pong { request_id }),
         _ => None,
     }
 }
@@ -705,7 +749,7 @@ pub async fn perform_client_handshake(
                             let msg2: ControlMessage = serde_json::from_str(&text2)?;
                             match msg2 {
                                 ControlMessage::HandshakeComplete => {}
-                                ControlMessage::Error { message } => {
+                                ControlMessage::Error { message, .. } => {
                                     anyhow::bail!("Authentication failed: {}", message);
                                 }
                                 _ => anyhow::bail!("Expected HandshakeComplete after auth"),
@@ -721,7 +765,7 @@ pub async fn perform_client_handshake(
                         );
                     }
                 }
-                ControlMessage::Error { message } => {
+                ControlMessage::Error { message, .. } => {
                     anyhow::bail!("Handshake error: {}", message);
                 }
                 _ => anyhow::bail!("Expected AuthChallenge or HandshakeComplete"),
